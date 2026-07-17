@@ -35,9 +35,9 @@ WinMon is a secure Windows PC Remote Management tool that runs as a Telegram Bot
    - Customize `allowed_cmds` to restrict or permit specific console commands.
 
 3. **Build the Binary:**
-   To build the executable:
-   ```bash
-   go build -o winmon.exe ./cmd/winmon
+   To build the executable (hiding the console window on Windows):
+   ```cmd
+   go build -ldflags "-H windowsgui" -o winmon.exe cmd\winmon\main.go
    ```
 
 ## Running WinMon
