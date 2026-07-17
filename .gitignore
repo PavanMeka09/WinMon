@@ -1,0 +1,36 @@
+# Configuration and state
+config.json
+state.json
+
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+out/
+
+# Dependency directories (Go doesn't vendor by default, but just in case)
+vendor/
+
+# User-specific / Editor files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Gemini / Antigravity workspace files
+.gemini/
+.antigravity/
+
+# Log files
+*.log
