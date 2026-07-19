@@ -1198,6 +1198,10 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 		close(b.stopChan)
 
 	case "/implode":
+		if len(args) == 0 || strings.ToLower(args[0]) != "confirm" {
+			b.sendMessage(chatID, "⚠️ *WARNING*: This command will completely uninstall the WinMon service and delete all local config, state, and executable files from this PC.\n\nThis action is *IRREVERSIBLE*.\n\nTo proceed, please type:\n`/implode confirm`", msgID)
+			return
+		}
 		b.sendMessage(chatID, "💥 Initiating self-destruction. WinMon service and local files will be completely removed...", msgID)
 		err := updater.ImplodeService(b.cfg.BotToken, chatID)
 		if err != nil {
