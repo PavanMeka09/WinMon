@@ -27,6 +27,7 @@ func main() {
 	sessionHelper := flag.Bool("session-helper", false, "Run as user session helper")
 	helperCmd := flag.String("cmd", "", "Command to execute (for session helper)")
 	helperArgs := flag.String("args", "", "Arguments for the command (for session helper)")
+	consoleMode := flag.Bool("console", false, "Force running WinMon in console mode (skip service checks/installation)")
 	flag.Parse()
 
 	// 1. Session Helper Routing
@@ -48,6 +49,52 @@ func main() {
 			log.Fatalf("Service action failed: %v", err)
 		}
 		os.Exit(0)
+	}
+
+	// Auto-registration and startup (if not running as a service and not forced console)
+	if !service.IsRunningAsService() && !*consoleMode {
+		const svcName = "WinMon"
+		installed, err := service.IsServiceInstalled(svcName)
+		if err != nil {
+			log.Printf("Warning: Failed to check service installation status: %v", err)
+		}
+
+		if !installed {
+			log.Println("WinMon service is not installed. Requesting administrator privileges to install and start the service...")
+			err := service.ElevateProcess("-service install")
+			if err != nil {
+				log.Printf("Failed to request elevation: %v. Falling back to console mode.", err)
+			} else {
+				log.Println("Elevation request sent. Exiting parent process...")
+				os.Exit(0)
+			}
+		} else {
+			running, err := service.IsServiceRunning(svcName)
+			if err != nil {
+				log.Printf("Warning: Failed to check if service is running: %v", err)
+			}
+
+			if running {
+				log.Println("WinMon service is already running in the background. Exiting...")
+				os.Exit(0)
+			} else {
+				log.Println("WinMon service is installed but not running. Attempting to start the service...")
+				err = service.StartService(svcName)
+				if err != nil {
+					log.Printf("Failed to start service: %v. Requesting administrator privileges to start the service...", err)
+					errSvc := service.ElevateProcess("-service start")
+					if errSvc != nil {
+						log.Printf("Failed to request elevation: %v. Falling back to console mode.", errSvc)
+					} else {
+						log.Println("Elevation request sent. Exiting parent process...")
+						os.Exit(0)
+					}
+				} else {
+					log.Println("WinMon service started successfully. Exiting...")
+					os.Exit(0)
+				}
+			}
+		}
 	}
 
 	// 3. Normal execution (Service mode or Console mode)
@@ -102,6 +149,12 @@ func handleServiceAction(action string) error {
 		err := service.InstallService(svcName, svcDisplayName, svcDescription)
 		if err == nil {
 			fmt.Println("Service installed successfully.")
+			err = service.StartService(svcName)
+			if err == nil {
+				fmt.Println("Service started successfully.")
+			} else {
+				fmt.Printf("Failed to start service: %v\n", err)
+			}
 		}
 		return err
 	case "uninstall":
