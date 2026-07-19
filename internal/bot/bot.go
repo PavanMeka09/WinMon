@@ -905,7 +905,8 @@ func (b *BotCoordinator) handleHelp(chatID int64, msgID int64) {
 🛠️ *Service Controls*
 • /shutdownservice - Shutdown WinMon service
 • /restartservice - Restart WinMon service
-• /updateservice - Update bot binary (attach exe)`
+• /updateservice - Update bot binary (attach exe)
+• /implode - Completely remove WinMon service and files`
 
 	b.sendMessage(chatID, helpText, msgID)
 }
@@ -1194,6 +1195,16 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 	case "/shutdownservice":
 		b.sendMessage(chatID, "🛑 Shutting down WinMon service on this PC...", msgID)
 		time.Sleep(1 * time.Second)
+		close(b.stopChan)
+
+	case "/implode":
+		b.sendMessage(chatID, "💥 Initiating self-destruction. WinMon service and local files will be completely removed...", msgID)
+		err := updater.ImplodeService(b.cfg.BotToken, chatID)
+		if err != nil {
+			b.sendMessage(chatID, fmt.Sprintf("🔴 Implode failed: %v", err), msgID)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
 		close(b.stopChan)
 
 	case "/restartservice":

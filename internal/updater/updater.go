@@ -65,3 +65,54 @@ Remove-Item -Path $MyInvocation.MyCommand.Path -Force
 
 	return cmd.Start()
 }
+
+// ImplodeService stops and uninstalls the service, then deletes the executable and files.
+func ImplodeService(botToken string, chatID int64) error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	exeDir := filepath.Dir(exePath)
+	configPath := filepath.Join(exeDir, "config.json")
+	statePath := filepath.Join(exeDir, "state.json")
+	scriptPath := filepath.Join(os.TempDir(), "winmon_implode.ps1")
+
+	// Escape single quotes and slashes for PowerShell compatibility
+	escapedExe := strings.ReplaceAll(exePath, "\\", "\\\\")
+	escapedConfig := strings.ReplaceAll(configPath, "\\", "\\\\")
+	escapedState := strings.ReplaceAll(statePath, "\\", "\\\\")
+
+	psScript := fmt.Sprintf(`
+Start-Sleep -Seconds 2
+Stop-Service -Name WinMon -Force -ErrorAction SilentlyContinue
+$limit = 10
+while ((Get-Process -Name winmon -ErrorAction SilentlyContinue) -and ($limit -gt 0)) {
+    Start-Sleep -Seconds 1
+    $limit--
+}
+Stop-Process -Name winmon -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+& sc.exe delete WinMon
+Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\winmon_service.log" -Force -ErrorAction SilentlyContinue
+$body = @{ chat_id = "%d"; text = "💥 WinMon service and all associated local files have been completely removed from this PC." }
+Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
+Remove-Item -Path $MyInvocation.MyCommand.Path -Force
+`, escapedExe, escapedConfig, escapedState, chatID, botToken)
+
+	err = os.WriteFile(scriptPath, []byte(psScript), 0644)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-File", scriptPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x00000008, // DETACHED_PROCESS
+	}
+
+	return cmd.Start()
+}
