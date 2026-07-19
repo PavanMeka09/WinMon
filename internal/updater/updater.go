@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"winmon/internal/service"
 )
 
 // ValidateBinary checks if the file is a valid Windows executable (PE format starting with "MZ").
@@ -36,7 +38,7 @@ func UpdateService(tempExePath, botToken string, chatID int64) error {
 		return err
 	}
 
-	scriptPath := filepath.Join(os.TempDir(), "winmon_update.ps1")
+	scriptPath := filepath.Join(service.GetSharedTempDir(), "winmon_update.ps1")
 
 	// Escape single quotes and slashes for PowerShell compatibility
 	escapedTemp := strings.ReplaceAll(tempExePath, "\\", "\\\\")
@@ -76,7 +78,7 @@ func ImplodeService(botToken string, chatID int64) error {
 	exeDir := filepath.Dir(exePath)
 	configPath := filepath.Join(exeDir, "config.json")
 	statePath := filepath.Join(exeDir, "state.json")
-	scriptPath := filepath.Join(os.TempDir(), "winmon_implode.ps1")
+	scriptPath := filepath.Join(service.GetSharedTempDir(), "winmon_implode.ps1")
 
 	// Escape single quotes and slashes for PowerShell compatibility
 	escapedExe := strings.ReplaceAll(exePath, "\\", "\\\\")

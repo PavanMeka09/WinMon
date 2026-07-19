@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 	"unsafe"
@@ -94,6 +95,15 @@ func logDebug(format string, a ...interface{}) {
 	}
 	defer f.Close()
 	fmt.Fprintf(f, "[%s] "+format+"\n", append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, a...)...)
+}
+
+// GetSharedTempDir returns the consistent shared temp directory path (C:\Windows\Temp by default).
+func GetSharedTempDir() string {
+	sharedTemp := "C:\\Windows\\Temp"
+	if envRoot := os.Getenv("SystemRoot"); envRoot != "" {
+		sharedTemp = filepath.Join(envRoot, "Temp")
+	}
+	return sharedTemp
 }
 
 // RunInUserSession spawns WinMon.exe as a helper inside the active console session.
