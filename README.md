@@ -4,11 +4,11 @@ WinMon is a secure Windows PC Remote Management tool that runs as a Telegram Bot
 
 ## Features
 
-- **Remote Shell Execution:** Run permitted commands securely via Telegram commands.
+- **Remote Shell Execution:** Run shell commands directly via Telegram commands.
 - **Screen & Display:** Capture screenshots, control display.
 - **System Control:** Monitor process lists, network status, system info.
 - **Service Integration:** Easily install, uninstall, start, or stop WinMon as a native Windows service.
-- **Security:** Limits access to designated Telegram User IDs and specifies allowed commands in configuration.
+- **Security:** Limits access to designated Telegram User IDs.
 
 ## Prerequisites
 
@@ -32,7 +32,8 @@ WinMon is a secure Windows PC Remote Management tool that runs as a Telegram Bot
    Edit `config.json` to include:
    - `bot_token`: Your Telegram Bot Token.
    - `allowed_users`: An array containing your Telegram User ID(s) (only these users will be allowed to control the bot).
-   - Customize `allowed_cmds` to restrict or permit specific console commands.
+
+   *(Note: `device_id` and `device_name` are dynamically determined using the computer's hostname and hardware UUID, meaning the same executable and configuration files can be shared across multiple computers without conflicts).*
 
 3. **Build the Binary:**
    To build the executable (hiding the console window on Windows):
