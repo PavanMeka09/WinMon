@@ -1117,7 +1117,7 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 		}
 		cmdLine := strings.Join(args, " ")
 		b.sendChatAction(chatID, "typing")
-		out, err := shell.ExecuteCommand(cmdLine, time.Duration(b.cfg.CommandTimeoutSeconds)*time.Second, b.cfg.AllowedCmds)
+		out, err := shell.ExecuteCommand(cmdLine, time.Duration(b.cfg.CommandTimeoutSeconds)*time.Second)
 		if err != nil {
 			b.sendMessage(chatID, fmt.Sprintf("🔴 Execution Error: %v\n\n```\n%s\n```", err, out), msgID)
 		} else {

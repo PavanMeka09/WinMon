@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"winmon/internal/device"
 )
 
 type Config struct {
@@ -27,6 +29,11 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+
+	// Dynamically override DeviceName and DeviceID with local hardware details
+	cfg.DeviceName = device.GetComputerName()
+	cfg.DeviceID = device.GetComputerUUID()
+
 	return &cfg, nil
 }
 

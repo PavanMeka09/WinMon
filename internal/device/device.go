@@ -203,3 +203,34 @@ func FormatDuration(d time.Duration) string {
 
 	return strings.Join(parts, " ")
 }
+
+func GetComputerName() string {
+	name, err := os.Hostname()
+	if err != nil || name == "" {
+		return "Unknown-PC"
+	}
+	return name
+}
+
+func GetComputerUUID() string {
+	uuid, err := runPowerShell("(Get-CimInstance Win32_ComputerSystemProduct).UUID")
+	if err == nil && uuid != "" {
+		// Clean and validate that the UUID is not all zeros or placeholder
+		cleaned := strings.ToLower(strings.TrimSpace(uuid))
+		if cleaned != "" && cleaned != "00000000-0000-0000-0000-000000000000" {
+			return cleaned
+		}
+	}
+
+	// Fallback to FNV hash of hostname to guarantee a stable, unique ID
+	name := GetComputerName()
+	importHash := func(s string) string {
+		var sum uint32 = 2166136261
+		for i := 0; i < len(s); i++ {
+			sum ^= uint32(s[i])
+			sum *= 16777619
+		}
+		return fmt.Sprintf("fallback-%08x", sum)
+	}
+	return importHash(name)
+}
