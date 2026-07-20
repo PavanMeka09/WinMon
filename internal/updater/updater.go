@@ -53,18 +53,25 @@ func UpdateService(tempExePath, botToken string, chatID int64) error {
 	}
 
 	psScript := fmt.Sprintf(`
+$ErrorActionPreference = "Stop"
 Set-Location -Path "C:\"
 Start-Sleep -Seconds 2
 Stop-Service -Name WinMon -Force -ErrorAction SilentlyContinue
 Stop-Process -Name winmon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
-Copy-Item -Path "%s" -Destination "%s" -Force
-Remove-Item -Path "%s" -Force
-%s
-$body = @{ chat_id = "%d"; text = "%s" }
-Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
+try {
+    Copy-Item -Path "%s" -Destination "%s" -Force
+    Remove-Item -Path "%s" -Force
+    %s
+    $body = @{ chat_id = "%d"; text = "%s" }
+    Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
+} catch {
+    $errText = "🔴 Update failed on this PC during copy: " + $_.Exception.Message
+    $body = @{ chat_id = "%d"; text = $errText }
+    Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
+}
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force
-`, slashedTemp, slashedExe, slashedTemp, startCmd, chatID, successMsg, botToken)
+`, slashedTemp, slashedExe, slashedTemp, startCmd, chatID, successMsg, botToken, chatID, botToken)
 
 	err = os.WriteFile(scriptPath, []byte(psScript), 0644)
 	if err != nil {

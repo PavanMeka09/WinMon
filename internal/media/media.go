@@ -21,6 +21,7 @@ import (
 var (
 	user32                      = syscall.NewLazyDLL("user32.dll")
 	procSendMessageW            = user32.NewProc("SendMessageW")
+	procDestroyWindow           = user32.NewProc("DestroyWindow")
 	avicap32                    = syscall.NewLazyDLL("avicap32.dll")
 	procCapCreateCaptureWindowW = avicap32.NewProc("capCreateCaptureWindowW")
 	winmm                       = syscall.NewLazyDLL("winmm.dll")
@@ -61,7 +62,7 @@ func CaptureWebcam(outputPath string) error {
 	if hwnd == 0 {
 		return fmt.Errorf("failed to create capture window")
 	}
-	defer user32.NewProc("DestroyWindow").Call(hwnd)
+	defer procDestroyWindow.Call(hwnd)
 
 	// WM_CAP_DRIVER_CONNECT = 1034 (0x040A)
 	ret, _, _ := procSendMessageW.Call(hwnd, 1034, 0, 0)

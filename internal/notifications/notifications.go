@@ -3,6 +3,7 @@ package notifications
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -69,15 +70,18 @@ func ShowAlert(title, message string) error {
 
 // ShowToastLocal displays a native Windows toast notification. This must be executed in the user's interactive session.
 func ShowToastLocal(title, message string) error {
+	escapedTitle := strings.ReplaceAll(title, "'", "''")
+	escapedMessage := strings.ReplaceAll(message, "'", "''")
+
 	psScript := fmt.Sprintf(`
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 $Template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
 $RawXml = [xml]$Template.GetXml()
-$RawXml.toast.visual.binding.text[0].AppendChild($RawXml.CreateTextNode("%s")) | Out-Null
-$RawXml.toast.visual.binding.text[1].AppendChild($RawXml.CreateTextNode("%s")) | Out-Null
+$RawXml.toast.visual.binding.text[0].AppendChild($RawXml.CreateTextNode('%s')) | Out-Null
+$RawXml.toast.visual.binding.text[1].AppendChild($RawXml.CreateTextNode('%s')) | Out-Null
 $AppId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId).Show((New-Object Windows.UI.Notifications.ToastNotification($RawXml)))
-`, title, message)
+`, escapedTitle, escapedMessage)
 
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}

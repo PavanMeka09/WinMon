@@ -142,6 +142,18 @@ func (b *BotCoordinator) request(method string, payload interface{}) ([]byte, er
 }
 
 // Local State management
+func (b *BotCoordinator) getLocalState() *LocalState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.localState == nil {
+		return nil
+	}
+	return &LocalState{
+		ChatID:          b.localState.ChatID,
+		PinnedMessageID: b.localState.PinnedMessageID,
+	}
+}
+
 func (b *BotCoordinator) loadLocalState() error {
 	data, err := os.ReadFile(b.statePath)
 	if err != nil {
@@ -151,7 +163,9 @@ func (b *BotCoordinator) loadLocalState() error {
 	if err := json.Unmarshal(data, &ls); err != nil {
 		return err
 	}
+	b.mu.Lock()
 	b.localState = &ls
+	b.mu.Unlock()
 	return nil
 }
 
@@ -161,7 +175,9 @@ func (b *BotCoordinator) saveLocalState(chatID, msgID int64) error {
 	if err != nil {
 		return err
 	}
+	b.mu.Lock()
 	b.localState = &ls
+	b.mu.Unlock()
 	return os.WriteFile(b.statePath, data, 0644)
 }
 
@@ -172,14 +188,15 @@ var (
 
 // Telegram Pinned State management
 func (b *BotCoordinator) getPinnedState() (*PinnedState, error) {
-	if b.localState == nil {
+	ls := b.getLocalState()
+	if ls == nil {
 		return nil, fmt.Errorf("local state not loaded")
 	}
 
 	type GetChatReq struct {
 		ChatID int64 `json:"chat_id"`
 	}
-	respBytes, err := b.request("getChat", GetChatReq{ChatID: b.localState.ChatID})
+	respBytes, err := b.request("getChat", GetChatReq{ChatID: ls.ChatID})
 	if err != nil {
 		return nil, err
 	}
@@ -219,15 +236,16 @@ func (b *BotCoordinator) getPinnedState() (*PinnedState, error) {
 	}
 
 	// Only update local state if the pinned message ID changed AND it is a valid WinMon state
-	if wrapper.Result.PinnedMessage.MessageID != b.localState.PinnedMessageID {
-		_ = b.saveLocalState(b.localState.ChatID, wrapper.Result.PinnedMessage.MessageID)
+	if wrapper.Result.PinnedMessage.MessageID != ls.PinnedMessageID {
+		_ = b.saveLocalState(ls.ChatID, wrapper.Result.PinnedMessage.MessageID)
 	}
 
 	return &state, nil
 }
 
 func (b *BotCoordinator) updatePinnedState(state *PinnedState) error {
-	if b.localState == nil {
+	ls := b.getLocalState()
+	if ls == nil {
 		return fmt.Errorf("local state not loaded")
 	}
 
@@ -246,8 +264,8 @@ func (b *BotCoordinator) updatePinnedState(state *PinnedState) error {
 	}
 
 	_, err = b.request("editMessageText", EditMsgReq{
-		ChatID:    b.localState.ChatID,
-		MessageID: b.localState.PinnedMessageID,
+		ChatID:    ls.ChatID,
+		MessageID: ls.PinnedMessageID,
 		Text:      text,
 		ParseMode: "Markdown",
 	})
@@ -515,9 +533,10 @@ func (b *BotCoordinator) runMeshLoop() {
 			role, err := b.checkRole()
 			if err != nil {
 				log.Printf("Error checking role: %v", err)
-				if b.localState != nil && (errors.Is(err, ErrNoPinnedState) || errors.Is(err, ErrInvalidPinnedState)) {
+				ls := b.getLocalState()
+				if ls != nil && (errors.Is(err, ErrNoPinnedState) || errors.Is(err, ErrInvalidPinnedState)) {
 					log.Println("Pinned state is missing or invalid. Re-initializing pinned state...")
-					if initErr := b.createPinnedState(b.localState.ChatID); initErr != nil {
+					if initErr := b.createPinnedState(ls.ChatID); initErr != nil {
 						log.Printf("Failed to re-initialize pinned state: %v", initErr)
 					} else {
 						log.Println("Pinned state successfully re-initialized.")
@@ -621,6 +640,12 @@ func (b *BotCoordinator) pollPinnedState() {
 		return
 	}
 
+	ls := b.getLocalState()
+	if ls == nil {
+		return
+	}
+	chatID := ls.ChatID
+
 	// 1. Check for pending commands targeting us
 	if state.PendingCommand != nil && state.PendingCommand.TargetDevice == b.cfg.DeviceID {
 		cmd := state.PendingCommand.Command
@@ -637,7 +662,7 @@ func (b *BotCoordinator) pollPinnedState() {
 				defer func() {
 					if r := recover(); r != nil {
 						errText := fmt.Sprintf("🔴 Execution Panicked: %v", r)
-						b.sendMessage(b.localState.ChatID, errText, 0)
+						b.sendMessage(chatID, errText, 0)
 					}
 				}()
 				f()
@@ -647,18 +672,18 @@ func (b *BotCoordinator) pollPinnedState() {
 		if cmd == "/upload" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
 			dest := strings.Join(args, " ")
-			runBg(func() { b.handleDocumentUpload(doc, b.localState.ChatID, 0, dest) })
+			runBg(func() { b.handleDocumentUpload(doc, chatID, 0, dest) })
 		} else if cmd == "/updateservice" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			runBg(func() { b.handleServiceUpdate(doc, b.localState.ChatID, 0) })
+			runBg(func() { b.handleServiceUpdate(doc, chatID, 0) })
 		} else if cmd == "/playsound" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			runBg(func() { b.handlePlaySound(doc, b.localState.ChatID, 0) })
+			runBg(func() { b.handlePlaySound(doc, chatID, 0) })
 		} else if cmd == "/setwallpaper" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			runBg(func() { b.handleSetWallpaper(doc, b.localState.ChatID, 0) })
+			runBg(func() { b.handleSetWallpaper(doc, chatID, 0) })
 		} else {
-			runBg(func() { b.executeCommandLocally(cmd, args, b.localState.ChatID, 0) })
+			runBg(func() { b.executeCommandLocally(cmd, args, chatID, 0) })
 		}
 	}
 
@@ -672,10 +697,10 @@ func (b *BotCoordinator) pollPinnedState() {
 			defer func() {
 				if r := recover(); r != nil {
 					errText := fmt.Sprintf("🔴 Broadcast Execution Panicked: %v", r)
-					b.sendMessage(b.localState.ChatID, errText, 0)
+					b.sendMessage(chatID, errText, 0)
 				}
 			}()
-			b.executeCommandLocally(cmd, args, b.localState.ChatID, 0)
+			b.executeCommandLocally(cmd, args, chatID, 0)
 		}()
 	}
 }
@@ -1874,11 +1899,12 @@ func (b *BotCoordinator) handleServiceUpdate(doc *TelegramDocument, chatID int64
 		b.sendMessage(chatID, fmt.Sprintf("Failed to create temporary update file: %v", err), msgID)
 		return
 	}
-	defer out.Close()
 
 	_, err = io.Copy(out, resp.Body)
+	out.Close() // Close immediately to release file lock on Windows
 	if err != nil {
 		b.sendMessage(chatID, fmt.Sprintf("Failed to write update binary: %v", err), msgID)
+		os.Remove(tempPath)
 		return
 	}
 

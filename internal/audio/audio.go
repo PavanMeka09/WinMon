@@ -78,7 +78,7 @@ func setVolumeCOM(volume float32, mute *bool) error {
 	procCoInitializeEx.Call(0, 2)
 	defer procCoUninitialize.Call()
 
-	var enumerator uintptr
+	var enumerator unsafe.Pointer
 	ret, _, _ := procCoCreateInstance.Call(
 		uintptr(unsafe.Pointer(&CLSID_MMDeviceEnumerator)),
 		0,
@@ -91,42 +91,42 @@ func setVolumeCOM(volume float32, mute *bool) error {
 	}
 	defer releaseCOM(enumerator)
 
-	var device uintptr
+	var device unsafe.Pointer
 	// GetDefaultAudioEndpoint (offset 4)
-	vtable := *(*uintptr)(unsafe.Pointer(enumerator))
-	fn := *(*uintptr)(unsafe.Pointer(vtable + 4*unsafe.Sizeof(uintptr(0))))
-	ret, _, _ = syscall.SyscallN(fn, enumerator, 0, 0, uintptr(unsafe.Pointer(&device)))
+	vtable := *(*unsafe.Pointer)(enumerator)
+	fn := *(*uintptr)(unsafe.Add(vtable, 4*unsafe.Sizeof(uintptr(0))))
+	ret, _, _ = syscall.SyscallN(fn, uintptr(enumerator), 0, 0, uintptr(unsafe.Pointer(&device)))
 	if ret != 0 {
 		return fmt.Errorf("GetDefaultAudioEndpoint failed: HRESULT 0x%X", ret)
 	}
 	defer releaseCOM(device)
 
-	var endpointVolume uintptr
+	var endpointVolume unsafe.Pointer
 	// Activate (offset 3)
-	vtable = *(*uintptr)(unsafe.Pointer(device))
-	fn = *(*uintptr)(unsafe.Pointer(vtable + 3*unsafe.Sizeof(uintptr(0))))
-	ret, _, _ = syscall.SyscallN(fn, device, uintptr(unsafe.Pointer(&IID_IAudioEndpointVolume)), 23, 0, uintptr(unsafe.Pointer(&endpointVolume)))
+	vtable = *(*unsafe.Pointer)(device)
+	fn = *(*uintptr)(unsafe.Add(vtable, 3*unsafe.Sizeof(uintptr(0))))
+	ret, _, _ = syscall.SyscallN(fn, uintptr(device), uintptr(unsafe.Pointer(&IID_IAudioEndpointVolume)), 23, 0, uintptr(unsafe.Pointer(&endpointVolume)))
 	if ret != 0 {
 		return fmt.Errorf("Activate failed: HRESULT 0x%X", ret)
 	}
 	defer releaseCOM(endpointVolume)
 
-	vtable = *(*uintptr)(unsafe.Pointer(endpointVolume))
+	vtable = *(*unsafe.Pointer)(endpointVolume)
 	if mute != nil {
 		// SetMute (offset 14)
 		var val uintptr = 0
 		if *mute {
 			val = 1
 		}
-		fn = *(*uintptr)(unsafe.Pointer(vtable + 14*unsafe.Sizeof(uintptr(0))))
-		ret, _, _ = syscall.SyscallN(fn, endpointVolume, val, 0)
+		fn = *(*uintptr)(unsafe.Add(vtable, 14*unsafe.Sizeof(uintptr(0))))
+		ret, _, _ = syscall.SyscallN(fn, uintptr(endpointVolume), val, 0)
 		if ret != 0 {
 			return fmt.Errorf("SetMute failed: HRESULT 0x%X", ret)
 		}
 	} else {
 		// SetMasterVolumeLevelScalar (offset 7)
-		fn = *(*uintptr)(unsafe.Pointer(vtable + 7*unsafe.Sizeof(uintptr(0))))
-		ret = syscallVolume(fn, endpointVolume, volume, 0)
+		fn = *(*uintptr)(unsafe.Add(vtable, 7*unsafe.Sizeof(uintptr(0))))
+		ret = syscallVolume(fn, uintptr(endpointVolume), volume, 0)
 		if ret != 0 {
 			return fmt.Errorf("SetMasterVolumeLevelScalar failed: HRESULT 0x%X", ret)
 		}
@@ -135,13 +135,13 @@ func setVolumeCOM(volume float32, mute *bool) error {
 	return nil
 }
 
-func releaseCOM(obj uintptr) {
-	if obj == 0 {
+func releaseCOM(obj unsafe.Pointer) {
+	if obj == nil {
 		return
 	}
-	vtable := *(*uintptr)(unsafe.Pointer(obj))
-	fn := *(*uintptr)(unsafe.Pointer(vtable + 2*unsafe.Sizeof(uintptr(0)))) // Release is offset 2
-	syscall.SyscallN(fn, obj)
+	vtable := *(*unsafe.Pointer)(obj)
+	fn := *(*uintptr)(unsafe.Add(vtable, 2*unsafe.Sizeof(uintptr(0)))) // Release is offset 2
+	syscall.SyscallN(fn, uintptr(obj))
 }
 
 // SetVolume sets the master system volume (0 to 100).
