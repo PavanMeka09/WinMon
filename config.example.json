@@ -3,27 +3,7 @@
   "allowed_users": [
     123456789
   ],
-  "device_id": "desktop",
-  "device_name": "Gaming PC",
   "group": "home",
   "version": "1.0.0",
-  "max_upload_size_mb": 200,
-  "command_timeout_seconds": 20,
-  "allowed_cmds": [
-    "ipconfig",
-    "systeminfo",
-    "tasklist",
-    "netstat",
-    "hostname",
-    "whoami",
-    "ver",
-    "echo",
-    "dir",
-    "tree",
-    "nslookup",
-    "arp",
-    "route print",
-    "driverquery",
-    "wmic"
-  ]
+  "command_timeout_seconds": 20
 }

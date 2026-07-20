@@ -11,14 +11,10 @@ import (
 
 var (
 	user32                    = syscall.NewLazyDLL("user32.dll")
-	procSendMessageW          = user32.NewProc("SendMessageW")
 	procSystemParametersInfoW = user32.NewProc("SystemParametersInfoW")
 )
 
 const (
-	HWND_BROADCAST       = 0xFFFF
-	WM_SYSCOMMAND        = 0x0112
-	SC_MONITORPOWER      = 0xF170
 	SPI_SETDESKWALLPAPER = 20
 	SPIF_UPDATEINIFILE   = 0x01
 	SPIF_SENDCHANGE      = 0x02
@@ -35,22 +31,6 @@ func SetBrightness(brightness int) error {
 	c := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd)
 	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	return c.Run()
-}
-
-// TurnMonitorOff turns off the monitor by sending a SC_MONITORPOWER command to HWND_BROADCAST.
-func TurnMonitorOff() error {
-	ret, _, err := procSendMessageW.Call(
-		HWND_BROADCAST,
-		WM_SYSCOMMAND,
-		SC_MONITORPOWER,
-		2, // 2 = Off, -1 = On, 1 = Low Power
-	)
-	// SendMessageW returns LRESULT. Zero indicates it was handled, but return code depends on message.
-	// Typically on success it returns non-zero, but we check if err is non-nil (0 is syscall.Errno = 0)
-	if ret == 0 && err != syscall.Errno(0) {
-		return err
-	}
-	return nil
 }
 
 // GetWallpaperPath retrieves the current desktop wallpaper file path from the registry.

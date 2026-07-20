@@ -55,6 +55,12 @@ type PROCESS_INFORMATION struct {
 	ThreadId  uint32
 }
 
+// SafeClose closes a channel if it isn't already closed.
+func SafeClose(ch chan struct{}) {
+	defer func() { recover() }()
+	close(ch)
+}
+
 // WinMonService implements svc.Handler
 type WinMonService struct {
 	StopChan chan struct{}
@@ -74,11 +80,14 @@ loop:
 				changes <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				changes <- svc.Status{State: svc.StopPending}
-				close(m.StopChan)
+				SafeClose(m.StopChan)
 				break loop
 			default:
 				// Ignore unsupported control codes
 			}
+		case <-m.StopChan:
+			changes <- svc.Status{State: svc.StopPending}
+			break loop
 		}
 	}
 	changes <- svc.Status{State: svc.Stopped}
@@ -241,13 +250,11 @@ func InstallService(name, displayName, desc string) error {
 			return fmt.Errorf("failed to copy executable to %s: %w", targetExePath, err)
 		}
 
-		// Optionally copy local config/state files if they exist in the current folder
+		// Optionally copy local state file if it exists in the current folder
 		srcDir := filepath.Dir(exePath)
-		for _, filename := range []string{"config.json", "state.json"} {
-			srcFile := filepath.Join(srcDir, filename)
-			if _, err := os.Stat(srcFile); err == nil {
-				_ = copyFile(srcFile, filepath.Join(targetDir, filename))
-			}
+		srcFile := filepath.Join(srcDir, "state.json")
+		if _, err := os.Stat(srcFile); err == nil {
+			_ = copyFile(srcFile, filepath.Join(targetDir, "state.json"))
 		}
 
 		exePath = targetExePath

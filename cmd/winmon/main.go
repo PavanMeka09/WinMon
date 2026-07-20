@@ -98,14 +98,9 @@ func main() {
 	}
 
 	// 3. Normal execution (Service mode or Console mode)
-	cfgPath := config.GetDefaultConfigPath()
-	cfg, err := config.LoadConfig(cfgPath)
+	cfg, err := config.LoadConfig()
 	if err != nil {
-		// Look in working directory if execution folder fails
-		cfg, err = config.LoadConfig("config.json")
-		if err != nil {
-			log.Fatalf("Failed to load configuration config.json: %v", err)
-		}
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
 	stopChan := make(chan struct{})

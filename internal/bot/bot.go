@@ -931,6 +931,8 @@ func (b *BotCoordinator) handleHelp(chatID int64, msgID int64) {
 • /processes [filter] - List top running processes
 • /kill <process> - Kill running process
 • /cmd <cmd> - Execute shell command
+• /shutdown - Shutdown this PC
+• /restart - Restart this PC
 
 📂 *File Management*
 • /download <path> - Download file or ZIP folder
@@ -959,7 +961,6 @@ func (b *BotCoordinator) handleHelp(chatID int64, msgID int64) {
 
 🖥️ *Display*
 • /brightness <0-100> - Adjust monitor brightness
-• /monitoroff - Turn off display monitor
 • /wallpaper - Fetch current desktop wallpaper
 • /setwallpaper - Set desktop wallpaper (attach image)
 
@@ -1063,6 +1064,19 @@ func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, chatID
 	cancelTyping := b.startTypingIndicator(chatID, action)
 	defer cancelTyping()
 
+	// Early validation to avoid spawning unnecessary helper processes
+	if cmd == "/brightness" {
+		if len(args) < 1 {
+			b.sendMessage(chatID, "Usage: `/brightness <0-100>`", msgID)
+			return
+		}
+		_, err := strconv.Atoi(args[0])
+		if err != nil {
+			b.sendMessage(chatID, "Brightness must be an integer.", msgID)
+			return
+		}
+	}
+
 	// Check if this command is interactive (must run in user session helper if running as service)
 	isInteractive := false
 	interactiveCmds := map[string]bool{
@@ -1081,6 +1095,7 @@ func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, chatID
 		"/mouse":        true,
 		"/clipboard":    true,
 		"/setclipboard": true,
+		"/brightness":   true,
 	}
 
 	if _, ok := interactiveCmds[cmd]; ok {
@@ -1238,10 +1253,6 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 		display.SetBrightness(bri)
 		b.sendMessage(chatID, fmt.Sprintf("🔆 Brightness adjusted to %d%%", bri), msgID)
 
-	case "/monitoroff":
-		display.TurnMonitorOff()
-		b.sendMessage(chatID, "🖥️ Monitor turned off.", msgID)
-
 	case "/alert":
 		if len(args) < 1 {
 			b.sendMessage(chatID, "Usage: `/alert <message>`", msgID)
@@ -1257,6 +1268,22 @@ func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, 
 		b.sendMessage(chatID, "🛑 Shutting down WinMon service on this PC...", msgID)
 		time.Sleep(1 * time.Second)
 		close(b.stopChan)
+
+	case "/shutdown":
+		b.sendMessage(chatID, "🔌 Shutting down the PC...", msgID)
+		time.Sleep(1 * time.Second)
+		err := exec.Command("shutdown", "/s", "/t", "0").Run()
+		if err != nil {
+			b.sendMessage(chatID, fmt.Sprintf("🔴 Shutdown failed: %v", err), msgID)
+		}
+
+	case "/restart":
+		b.sendMessage(chatID, "🔄 Restarting the PC...", msgID)
+		time.Sleep(1 * time.Second)
+		err := exec.Command("shutdown", "/r", "/t", "0").Run()
+		if err != nil {
+			b.sendMessage(chatID, fmt.Sprintf("🔴 Restart failed: %v", err), msgID)
+		}
 
 	case "/implode":
 		if len(args) == 0 || strings.ToLower(args[0]) != "confirm" {
@@ -1637,6 +1664,8 @@ func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int6
 				b.sendMessage(chatID, "Failed to capture wallpaper from session helper.", msgID)
 			}
 		}
+	case "/brightness":
+		b.sendMessage(chatID, "🔆 Brightness adjusted successfully in user session.", msgID)
 	default:
 		// Commands like type, setvol, mute, toast etc don't return files, they just succeed.
 		b.sendMessage(chatID, "🟢 Command completed successfully in user session.", msgID)
@@ -1801,6 +1830,12 @@ func RunSessionHelper(cmd string, args string) error {
 		return os.WriteFile(tempPath, []byte(txt), 0644)
 	case "/setclipboard":
 		return clipboard.SetClipboardLocal(args)
+	case "/brightness":
+		bri, err := strconv.Atoi(args)
+		if err != nil {
+			return fmt.Errorf("brightness must be an integer: %w", err)
+		}
+		return display.SetBrightness(bri)
 	}
 
 	return fmt.Errorf("unsupported helper command: %s", cmd)
