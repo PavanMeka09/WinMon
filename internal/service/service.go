@@ -2,8 +2,10 @@ package service
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -225,6 +227,32 @@ func InstallService(name, displayName, desc string) error {
 		return err
 	}
 
+	// Define standard installation folder in Program Files
+	targetDir := `C:\Program Files\WinMon`
+	targetExePath := filepath.Join(targetDir, "winmon.exe")
+
+	// If we are not already running from the target path, copy ourselves there
+	if !strings.EqualFold(exePath, targetExePath) {
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
+		}
+
+		if err := copyFile(exePath, targetExePath); err != nil {
+			return fmt.Errorf("failed to copy executable to %s: %w", targetExePath, err)
+		}
+
+		// Optionally copy local config/state files if they exist in the current folder
+		srcDir := filepath.Dir(exePath)
+		for _, filename := range []string{"config.json", "state.json"} {
+			srcFile := filepath.Join(srcDir, filename)
+			if _, err := os.Stat(srcFile); err == nil {
+				_ = copyFile(srcFile, filepath.Join(targetDir, filename))
+			}
+		}
+
+		exePath = targetExePath
+	}
+
 	s, err := m.CreateService(name, exePath, mgr.Config{
 		DisplayName: displayName,
 		Description: desc,
@@ -243,6 +271,23 @@ func InstallService(name, displayName, desc string) error {
 	}
 
 	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
 }
 
 func UninstallService(name string) error {

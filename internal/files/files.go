@@ -26,15 +26,16 @@ func ZipDirectory(sourceDir, zipPath string) error {
 		return err
 	}
 
-	err = filepath.Walk(absSource, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	err = filepath.Walk(absSource, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			// Skip unreadable files or directories
+			return nil
 		}
 
 		// Skip the output zip file itself if it is being saved in the same directory
 		absPath, err := filepath.Abs(path)
 		if err != nil {
-			return err
+			return nil
 		}
 		absZip, _ := filepath.Abs(zipPath)
 		if absPath == absZip {
@@ -44,7 +45,7 @@ func ZipDirectory(sourceDir, zipPath string) error {
 		// Get relative path for the zip headers
 		relPath, err := filepath.Rel(absSource, path)
 		if err != nil {
-			return err
+			return nil
 		}
 
 		if relPath == "." {
@@ -53,7 +54,7 @@ func ZipDirectory(sourceDir, zipPath string) error {
 
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
-			return err
+			return nil
 		}
 
 		// Standardize separators to forward slashes for ZIP format compatibility
@@ -75,12 +76,13 @@ func ZipDirectory(sourceDir, zipPath string) error {
 
 		file, err := os.Open(path)
 		if err != nil {
-			return err
+			// Skip locked or restricted files
+			return nil
 		}
 		defer file.Close()
 
-		_, err = io.Copy(writer, file)
-		return err
+		_, _ = io.Copy(writer, file)
+		return nil
 	})
 
 	return err

@@ -6,7 +6,46 @@ import (
 	"os/exec"
 	"syscall"
 	"time"
+	"unsafe"
 )
+
+var (
+	kernel32               = syscall.NewLazyDLL("kernel32.dll")
+	procMultiByteToWideChar = kernel32.NewProc("MultiByteToWideChar")
+)
+
+func oemToUTF8(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	// CP_OEMCP = 1
+	ret, _, _ := procMultiByteToWideChar.Call(
+		1, // CP_OEMCP
+		0,
+		uintptr(unsafe.Pointer(&b[0])),
+		uintptr(len(b)),
+		0,
+		0,
+	)
+	if ret == 0 {
+		return string(b)
+	}
+
+	buf := make([]uint16, ret)
+	ret, _, _ = procMultiByteToWideChar.Call(
+		1,
+		0,
+		uintptr(unsafe.Pointer(&b[0])),
+		uintptr(len(b)),
+		uintptr(unsafe.Pointer(&buf[0])),
+		ret,
+	)
+	if ret == 0 {
+		return string(b)
+	}
+
+	return syscall.UTF16ToString(buf)
+}
 
 // ExecuteCommand executes a command line string securely using cmd.exe /c
 func ExecuteCommand(cmdLine string, timeout time.Duration) (string, error) {
@@ -18,7 +57,7 @@ func ExecuteCommand(cmdLine string, timeout time.Duration) (string, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	outputBytes, err := cmd.CombinedOutput()
-	output := string(outputBytes)
+	output := oemToUTF8(outputBytes)
 
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("%s\n[ERROR: Command execution timed out after %s]", output, timeout), context.DeadlineExceeded

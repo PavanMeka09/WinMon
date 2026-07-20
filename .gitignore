@@ -34,3 +34,7 @@ Thumbs.db
 
 # Log files
 *.log
+
+# Embedded config secrets
+internal/config/config.json
+

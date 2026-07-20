@@ -2,12 +2,11 @@ package device
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
-	"regexp"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +35,21 @@ type DeviceInfo struct {
 	Uptime     time.Duration
 }
 
+type rawStatus struct {
+	CPUPercent    interface{} `json:"CPUPercent"`
+	RAMTotal      int64       `json:"RAMTotal"`
+	RAMFree       int64       `json:"RAMFree"`
+	DiskTotal     int64       `json:"DiskTotal"`
+	DiskFree      int64       `json:"DiskFree"`
+	BatteryCharge interface{} `json:"BatteryCharge"`
+	BatteryStatus interface{} `json:"BatteryStatus"`
+}
+
+var (
+	kernel32           = syscall.NewLazyDLL("kernel32.dll")
+	procGetTickCount64 = kernel32.NewProc("GetTickCount64")
+)
+
 func runPowerShell(cmd string) (string, error) {
 	c := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", cmd)
 	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
@@ -46,16 +60,8 @@ func runPowerShell(cmd string) (string, error) {
 }
 
 func GetUptime() (time.Duration, error) {
-	// Query LastBootUpTime using CIM
-	out, err := runPowerShell("(Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime | Select-Object -ExpandProperty TotalSeconds")
-	if err != nil {
-		return 0, err
-	}
-	secs, err := strconv.ParseFloat(out, 64)
-	if err != nil {
-		return 0, err
-	}
-	return time.Duration(secs) * time.Second, nil
+	ret, _, _ := procGetTickCount64.Call()
+	return time.Duration(ret) * time.Millisecond, nil
 }
 
 func GetOSVersion() (string, error) {
@@ -88,64 +94,65 @@ func GetIPAddresses() string {
 func GetStatus() (*StatusInfo, error) {
 	info := &StatusInfo{BatteryCharge: -1, BatteryStatus: "N/A"}
 
+	psCmd := `$cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average; ` +
+		`$ram = Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory; ` +
+		`$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object Size, FreeSpace; ` +
+		`$bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object EstimatedChargeRemaining, BatteryStatus; ` +
+		`[PSCustomObject]@{ ` +
+		`CPUPercent = $cpu; ` +
+		`RAMTotal = $ram.TotalVisibleMemorySize; ` +
+		`RAMFree = $ram.FreePhysicalMemory; ` +
+		`DiskTotal = $disk.Size; ` +
+		`DiskFree = $disk.FreeSpace; ` +
+		`BatteryCharge = if ($bat) { $bat.EstimatedChargeRemaining } else { $null }; ` +
+		`BatteryStatus = if ($bat) { $bat.BatteryStatus } else { $null }; ` +
+		`} | ConvertTo-Json`
+
+	outStr, err := runPowerShell(psCmd)
+	if err != nil {
+		return nil, err
+	}
+
+	var raw rawStatus
+	if err := json.Unmarshal([]byte(outStr), &raw); err != nil {
+		return nil, err
+	}
+
 	// CPU Usage
-	cpuStr, err := runPowerShell("(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average")
-	if err == nil {
-		if val, err := strconv.ParseFloat(cpuStr, 64); err == nil {
-			info.CPUPercent = val
+	if raw.CPUPercent != nil {
+		switch v := raw.CPUPercent.(type) {
+		case float64:
+			info.CPUPercent = v
+		case int:
+			info.CPUPercent = float64(v)
 		}
 	}
 
 	// RAM Usage (in KB)
-	ramStr, err := runPowerShell("Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json")
-	if err == nil {
-		// Quick parse free & total
-		reTotal := regexp.MustCompile(`"TotalVisibleMemorySize":\s*(\d+)`)
-		reFree := regexp.MustCompile(`"FreePhysicalMemory":\s*(\d+)`)
-		mTotal := reTotal.FindStringSubmatch(ramStr)
-		mFree := reFree.FindStringSubmatch(ramStr)
-		if len(mTotal) > 1 && len(mFree) > 1 {
-			totalKB, _ := strconv.ParseFloat(mTotal[1], 64)
-			freeKB, _ := strconv.ParseFloat(mFree[1], 64)
-			usedKB := totalKB - freeKB
-
-			info.RAMTotalGB = totalKB / (1024 * 1024)
-			info.RAMFreeGB = freeKB / (1024 * 1024)
-			info.RAMPercent = (usedKB / totalKB) * 100
-		}
+	if raw.RAMTotal > 0 {
+		totalGB := float64(raw.RAMTotal) / (1024 * 1024)
+		freeGB := float64(raw.RAMFree) / (1024 * 1024)
+		info.RAMTotalGB = totalGB
+		info.RAMFreeGB = freeGB
+		info.RAMPercent = ((totalGB - freeGB) / totalGB) * 100
 	}
 
 	// Disk Usage (C: Drive)
-	diskStr, err := runPowerShell("Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='C:'\" | Select-Object Size, FreeSpace | ConvertTo-Json")
-	if err == nil {
-		reSize := regexp.MustCompile(`"Size":\s*(\d+)`)
-		reFree := regexp.MustCompile(`"FreeSpace":\s*(\d+)`)
-		mSize := reSize.FindStringSubmatch(diskStr)
-		mFree := reFree.FindStringSubmatch(diskStr)
-		if len(mSize) > 1 && len(mFree) > 1 {
-			sizeBytes, _ := strconv.ParseFloat(mSize[1], 64)
-			freeBytes, _ := strconv.ParseFloat(mFree[1], 64)
-			usedBytes := sizeBytes - freeBytes
-
-			info.DiskTotalGB = sizeBytes / (1024 * 1024 * 1024)
-			info.DiskFreeGB = freeBytes / (1024 * 1024 * 1024)
-			info.DiskPercent = (usedBytes / sizeBytes) * 100
-		}
+	if raw.DiskTotal > 0 {
+		totalGB := float64(raw.DiskTotal) / (1024 * 1024 * 1024)
+		freeGB := float64(raw.DiskFree) / (1024 * 1024 * 1024)
+		info.DiskTotalGB = totalGB
+		info.DiskFreeGB = freeGB
+		info.DiskPercent = ((totalGB - freeGB) / totalGB) * 100
 	}
 
 	// Battery Status
-	batteryStr, err := runPowerShell("Get-CimInstance Win32_Battery | Select-Object EstimatedChargeRemaining, BatteryStatus | ConvertTo-Json")
-	if err == nil && strings.Contains(batteryStr, "EstimatedChargeRemaining") {
-		reCharge := regexp.MustCompile(`"EstimatedChargeRemaining":\s*(\d+)`)
-		reStatus := regexp.MustCompile(`"BatteryStatus":\s*(\d+)`)
-		mCharge := reCharge.FindStringSubmatch(batteryStr)
-		mStatus := reStatus.FindStringSubmatch(batteryStr)
-		if len(mCharge) > 1 {
-			charge, _ := strconv.Atoi(mCharge[1])
-			info.BatteryCharge = charge
+	if raw.BatteryCharge != nil {
+		if val, ok := raw.BatteryCharge.(float64); ok {
+			info.BatteryCharge = int(val)
 		}
-		if len(mStatus) > 1 {
-			statusInt, _ := strconv.Atoi(mStatus[1])
+		if statusVal, ok := raw.BatteryStatus.(float64); ok {
+			statusInt := int(statusVal)
 			// BatteryStatus mapping: 1=Other, 2=Unknown, 3=Fully Charged, 4=Low, 5=Critical, 6=Charging, 7=Charging and High, 8=Charging and Low, 9=Charging and Critical, 10=Undefined, 11=Partially Charged
 			switch statusInt {
 			case 3:

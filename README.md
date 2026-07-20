@@ -25,23 +25,33 @@ WinMon is a secure Windows PC Remote Management tool that runs as a Telegram Bot
    ```
 
 2. **Configure WinMon:**
-   Copy `config.example.json` to `config.json` and customize it:
-   ```bash
-   copy config.example.json config.json
+   Copy `config.example.json` to `internal/config/config.json` and customize it:
+   ```cmd
+   copy config.example.json internal\config\config.json
    ```
-   Edit `config.json` to include:
+   Edit `internal/config/config.json` to include:
    - `bot_token`: Your Telegram Bot Token.
    - `allowed_users`: An array containing your Telegram User ID(s) (only these users will be allowed to control the bot).
 
-   *(Note: `device_id` and `device_name` are dynamically determined using the computer's hostname and hardware UUID, meaning the same executable and configuration files can be shared across multiple computers without conflicts).*
+   *(Note: `device_id` and `device_name` are dynamically determined using the computer's hostname and hardware UUID, meaning the same executable can be shared across multiple computers without conflicts).*
 
 3. **Build the Binary:**
-   To build the executable (hiding the console window on Windows):
+   To build the standalone executable with your configuration embedded:
    ```cmd
    go build -ldflags "-H windowsgui" -o winmon.exe cmd\winmon\main.go
    ```
 
+   #### Obfuscated Build (Highly Recommended for Security)
+   To prevent anyone from extracting your Telegram Bot Token from the compiled executable, use [garble](https://github.com/burrowers/garble) to obfuscate and scramble package names, function names, and string literals:
+   ```cmd
+   go install mvdan.cc/garble@latest
+   garble -literals build -ldflags "-H windowsgui" -o winmon.exe cmd\winmon\main.go
+   ```
+
 ## Running WinMon
+
+> [!NOTE]
+> Since the configuration is embedded at build time, the compiled `winmon.exe` is completely self-contained. You do **not** need to place or keep `config.json` next to the executable.
 
 ### Console Mode
 
@@ -75,7 +85,8 @@ To run WinMon as a background service that starts automatically with Windows, ru
 
 - `cmd/winmon/`: Main entry point for the service and console runner.
 - `internal/`: Core components of WinMon (bot coordinator, service handlers, OS integrations).
-- `config.json`: Local configuration file (ignored by git).
+  - `internal/config/config.json`: Embedded configuration file containing your private credentials (ignored by git).
+  - `internal/config/config.json.template`: Default template to ensure compilation succeeds when no configuration is embedded (tracked by git).
 - `state.json`: Dynamic state tracking file (ignored by git).
 
 ## License

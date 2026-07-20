@@ -64,19 +64,24 @@ type LocalState struct {
 	PinnedMessageID int64 `json:"pinned_message_id"`
 }
 
+type LastMsgState struct {
+	ID      int64
+	Text    string
+	IsMedia bool
+}
+
 type BotCoordinator struct {
-	cfg            *config.Config
-	client         *http.Client
-	statePath      string
-	localState     *LocalState
-	mu             sync.Mutex
-	stopChan       chan struct{}
-	lastErrTime    time.Time
-	isPoller       bool
-	lastBroadcast  time.Time
-	lastMsgID      int64
-	lastMsgText    string
-	lastMsgIsMedia bool
+	cfg           *config.Config
+	client        *http.Client
+	statePath     string
+	localState    *LocalState
+	mu            sync.Mutex
+	stopChan      chan struct{}
+	lastErrTime   time.Time
+	isPoller      bool
+	lastBroadcast time.Time
+	lastMsgs      map[int64]*LastMsgState
+	lastMsgsMu    sync.Mutex
 }
 
 func NewBotCoordinator(cfg *config.Config, stopChan chan struct{}) *BotCoordinator {
@@ -93,6 +98,7 @@ func NewBotCoordinator(cfg *config.Config, stopChan chan struct{}) *BotCoordinat
 		client:    &http.Client{Timeout: 30 * time.Second},
 		statePath: statePath,
 		stopChan:  stopChan,
+		lastMsgs:  make(map[int64]*LastMsgState),
 	}
 }
 
@@ -336,11 +342,13 @@ func (b *BotCoordinator) sendMessage(chatID int64, text string, replyTo int64) i
 		return 0
 	}
 
-	b.mu.Lock()
-	b.lastMsgID = wrapper.Result.MessageID
-	b.lastMsgText = text
-	b.lastMsgIsMedia = false
-	b.mu.Unlock()
+	b.lastMsgsMu.Lock()
+	b.lastMsgs[replyTo] = &LastMsgState{
+		ID:      wrapper.Result.MessageID,
+		Text:    text,
+		IsMedia: false,
+	}
+	b.lastMsgsMu.Unlock()
 
 	return wrapper.Result.MessageID
 }
@@ -414,11 +422,13 @@ func (b *BotCoordinator) sendFile(chatID int64, method string, paramName string,
 		return 0, err
 	}
 
-	b.mu.Lock()
-	b.lastMsgID = wrapper.Result.MessageID
-	b.lastMsgText = ""
-	b.lastMsgIsMedia = true
-	b.mu.Unlock()
+	b.lastMsgsMu.Lock()
+	b.lastMsgs[replyTo] = &LastMsgState{
+		ID:      wrapper.Result.MessageID,
+		Text:    "",
+		IsMedia: true,
+	}
+	b.lastMsgsMu.Unlock()
 
 	return wrapper.Result.MessageID, nil
 }
@@ -556,9 +566,6 @@ func (b *BotCoordinator) isUserAuthorized(userID int64) bool {
 }
 
 func (b *BotCoordinator) sendHeartbeat() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	state, err := b.getPinnedState()
 	if err != nil {
 		return
@@ -575,6 +582,14 @@ func (b *BotCoordinator) sendHeartbeat() {
 	ds.Status = "online"
 
 	state.Devices[b.cfg.DeviceID] = ds
+
+	// Prune devices unseen for > 24 hours to stay within Telegram's 4096 character limit
+	now := time.Now()
+	for id, dev := range state.Devices {
+		if id != b.cfg.DeviceID && now.Sub(dev.LastSeen) > 24*time.Hour {
+			delete(state.Devices, id)
+		}
+	}
 
 	// If there's no active poller, or the active poller is offline (> 45s), claim it!
 	if state.ActivePoller == "" {
@@ -608,14 +623,6 @@ func (b *BotCoordinator) pollPinnedState() {
 
 	// 1. Check for pending commands targeting us
 	if state.PendingCommand != nil && state.PendingCommand.TargetDevice == b.cfg.DeviceID {
-		// Recover from panics to keep service running
-		defer func() {
-			if r := recover(); r != nil {
-				errText := fmt.Sprintf("🔴 Execution Panicked: %v", r)
-				b.sendMessage(b.localState.ChatID, errText, 0)
-			}
-		}()
-
 		cmd := state.PendingCommand.Command
 		args := state.PendingCommand.Args
 		fileID := state.PendingCommand.FileID
@@ -625,29 +632,51 @@ func (b *BotCoordinator) pollPinnedState() {
 		state.PendingCommand = nil
 		b.updatePinnedState(state)
 
+		runBg := func(f func()) {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						errText := fmt.Sprintf("🔴 Execution Panicked: %v", r)
+						b.sendMessage(b.localState.ChatID, errText, 0)
+					}
+				}()
+				f()
+			}()
+		}
+
 		if cmd == "/upload" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
 			dest := strings.Join(args, " ")
-			b.handleDocumentUpload(doc, b.localState.ChatID, 0, dest)
+			runBg(func() { b.handleDocumentUpload(doc, b.localState.ChatID, 0, dest) })
 		} else if cmd == "/updateservice" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			b.handleServiceUpdate(doc, b.localState.ChatID, 0)
+			runBg(func() { b.handleServiceUpdate(doc, b.localState.ChatID, 0) })
 		} else if cmd == "/playsound" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			b.handlePlaySound(doc, b.localState.ChatID, 0)
+			runBg(func() { b.handlePlaySound(doc, b.localState.ChatID, 0) })
 		} else if cmd == "/setwallpaper" && fileID != "" {
 			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			b.handleSetWallpaper(doc, b.localState.ChatID, 0)
+			runBg(func() { b.handleSetWallpaper(doc, b.localState.ChatID, 0) })
 		} else {
-			b.executeCommandLocally(cmd, args, b.localState.ChatID, 0)
+			runBg(func() { b.executeCommandLocally(cmd, args, b.localState.ChatID, 0) })
 		}
 	}
 
 	// 2. Check for broadcast commands we haven't executed yet
 	if state.BroadcastCommand != nil && state.BroadcastCommand.Timestamp.After(b.lastBroadcast) {
 		b.lastBroadcast = state.BroadcastCommand.Timestamp
-		// Run command
-		b.executeCommandLocally(state.BroadcastCommand.Command, state.BroadcastCommand.Args, b.localState.ChatID, 0)
+		// Run command in background
+		cmd := state.BroadcastCommand.Command
+		args := state.BroadcastCommand.Args
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errText := fmt.Sprintf("🔴 Broadcast Execution Panicked: %v", r)
+					b.sendMessage(b.localState.ChatID, errText, 0)
+				}
+			}()
+			b.executeCommandLocally(cmd, args, b.localState.ChatID, 0)
+		}()
 	}
 }
 
@@ -711,11 +740,6 @@ func (b *BotCoordinator) getUpdates(offset int64, timeout int) ([]TelegramUpdate
 
 // Command dispatch
 func (b *BotCoordinator) handleMessage(msg *TelegramMessage) {
-	b.mu.Lock()
-	b.lastMsgID = 0
-	b.lastMsgText = ""
-	b.lastMsgIsMedia = false
-	b.mu.Unlock()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -784,6 +808,18 @@ func (b *BotCoordinator) handleMessage(msg *TelegramMessage) {
 	}
 
 	if target == b.cfg.DeviceID {
+		runBg := func(f func()) {
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						errText := fmt.Sprintf("🔴 Execution Panicked: %v", r)
+						b.sendMessage(msg.Chat.ID, errText, msg.MessageID)
+					}
+				}()
+				f()
+			}()
+		}
+
 		if cmd == "/upload" {
 			if msg.Document == nil {
 				b.sendMessage(msg.Chat.ID, "File upload must include an attached document.", msg.MessageID)
@@ -794,27 +830,27 @@ func (b *BotCoordinator) handleMessage(msg *TelegramMessage) {
 				return
 			}
 			dest := strings.Join(args, " ")
-			b.handleDocumentUpload(msg.Document, msg.Chat.ID, msg.MessageID, dest)
+			runBg(func() { b.handleDocumentUpload(msg.Document, msg.Chat.ID, msg.MessageID, dest) })
 		} else if cmd == "/updateservice" {
 			if msg.Document == nil {
 				b.sendMessage(msg.Chat.ID, "Update service must include an attached executable.", msg.MessageID)
 				return
 			}
-			b.handleServiceUpdate(msg.Document, msg.Chat.ID, msg.MessageID)
+			runBg(func() { b.handleServiceUpdate(msg.Document, msg.Chat.ID, msg.MessageID) })
 		} else if cmd == "/playsound" {
 			if msg.Document == nil {
 				b.sendMessage(msg.Chat.ID, "Playsound must include an attached audio file.", msg.MessageID)
 				return
 			}
-			b.handlePlaySound(msg.Document, msg.Chat.ID, msg.MessageID)
+			runBg(func() { b.handlePlaySound(msg.Document, msg.Chat.ID, msg.MessageID) })
 		} else if cmd == "/setwallpaper" {
 			if msg.Document == nil {
 				b.sendMessage(msg.Chat.ID, "Setwallpaper must include an attached image file.", msg.MessageID)
 				return
 			}
-			b.handleSetWallpaper(msg.Document, msg.Chat.ID, msg.MessageID)
+			runBg(func() { b.handleSetWallpaper(msg.Document, msg.Chat.ID, msg.MessageID) })
 		} else {
-			b.executeCommandLocally(cmd, args, msg.Chat.ID, msg.MessageID)
+			runBg(func() { b.executeCommandLocally(cmd, args, msg.Chat.ID, msg.MessageID) })
 		}
 	} else {
 		// Route command to target worker using pinned message
@@ -869,7 +905,7 @@ func (b *BotCoordinator) handleHelp(chatID int64, msgID int64) {
 • /version - System, Bot, and Go versions
 • /processes [filter] - List top running processes
 • /kill <process> - Kill running process
-• /cmd <cmd> - Execute safe command (allowlisted)
+• /cmd <cmd> - Execute shell command
 
 📂 *File Management*
 • /download <path> - Download file or ZIP folder
@@ -1479,9 +1515,9 @@ func (b *BotCoordinator) handleKill(target string, chatID int64, msgID int64) {
 		cmd = exec.Command("taskkill", "/F", "/IM", target)
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	err := cmd.Run()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("🔴 Failed to terminate process `%s`.", target), msgID)
+		b.sendMessage(chatID, fmt.Sprintf("🔴 Failed to terminate process `%s`.\n\nError: %v\n```\n%s\n```", target, err, strings.TrimSpace(string(out))), msgID)
 	} else {
 		b.sendMessage(chatID, fmt.Sprintf("🟢 Successfully terminated process `%s`.", target), msgID)
 	}
@@ -1589,12 +1625,19 @@ func (b *BotCoordinator) sendExecutionTime(chatID int64, msgID int64, start time
 	durationMs := duration.Milliseconds()
 	completionText := fmt.Sprintf("\n\nCompleted successfully.\n\nExecution Time:\n%d ms", durationMs)
 
-	b.mu.Lock()
-	lastID := b.lastMsgID
-	lastText := b.lastMsgText
-	lastIsMedia := b.lastMsgIsMedia
-	b.lastMsgID = 0 // Reset
-	b.mu.Unlock()
+	b.lastMsgsMu.Lock()
+	state := b.lastMsgs[msgID]
+	delete(b.lastMsgs, msgID)
+	b.lastMsgsMu.Unlock()
+
+	lastID := int64(0)
+	lastText := ""
+	lastIsMedia := false
+	if state != nil {
+		lastID = state.ID
+		lastText = state.Text
+		lastIsMedia = state.IsMedia
+	}
 
 	if lastID != 0 {
 		if lastIsMedia {

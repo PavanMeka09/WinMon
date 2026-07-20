@@ -6,11 +6,39 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
 	winmm              = syscall.NewLazyDLL("winmm.dll")
 	procMciSendStringW = winmm.NewProc("mciSendStringW")
+
+	ole32                = syscall.NewLazyDLL("ole32.dll")
+	procCoInitializeEx   = ole32.NewProc("CoInitializeEx")
+	procCoCreateInstance = ole32.NewProc("CoCreateInstance")
+	procCoUninitialize   = ole32.NewProc("CoUninitialize")
+)
+
+var (
+	CLSID_MMDeviceEnumerator = windows.GUID{
+		Data1: 0xBCDE0395,
+		Data2: 0xE52F,
+		Data3: 0x467C,
+		Data4: [8]byte{0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E},
+	}
+	IID_IMMDeviceEnumerator = windows.GUID{
+		Data1: 0xA95664D2,
+		Data2: 0x9614,
+		Data3: 0x4F35,
+		Data4: [8]byte{0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6},
+	}
+	IID_IAudioEndpointVolume = windows.GUID{
+		Data1: 0x5CDF2C82,
+		Data2: 0x841E,
+		Data3: 0x4546,
+		Data4: [8]byte{0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A},
+	}
 )
 
 func runPowerShell(cmd string) error {
@@ -45,49 +73,75 @@ func PlaySoundLocal(path string) error {
 	return nil
 }
 
-// getVolumeScript returns the C# compilation script for controlling system volume.
-func getVolumeScript(action string) string {
-	base := `
-Add-Type -TypeDefinition @"
-using System.Runtime.InteropServices;
-[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IAudioEndpointVolume {
-    int f(); int g(); int h(); int i();
-    int SetMasterVolumeLevelScalar(float fLevel, System.Guid pguidEventContext);
-    int j();
-    int GetMasterVolumeLevelScalar(out float pfLevel);
-    int k(); int l(); int m(); int n();
-    int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, System.Guid pguidEventContext);
-    int GetMute(out bool pbMute);
-}
-[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDevice { int Activate(ref System.Guid id, int clsCtx, int activationParams, out IAudioEndpointVolume aev); }
-[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-interface IMMDeviceEnumerator { int f(); int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint); }
-[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumeratorComObject { }
+func setVolumeCOM(volume float32, mute *bool) error {
+	// COINIT_APARTMENTTHREADED = 2
+	procCoInitializeEx.Call(0, 2)
+	defer procCoUninitialize.Call()
 
-public class Audio {
-    static IAudioEndpointVolume Vol() {
-        var enumerator = new MMDeviceEnumeratorComObject() as IMMDeviceEnumerator;
-        IMMDevice dev = null;
-        Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint(0, 1, out dev));
-        IAudioEndpointVolume epv = null;
-        var epvid = typeof(IAudioEndpointVolume).GUID;
-        Marshal.ThrowExceptionForHR(dev.Activate(ref epvid, 23, 0, out epv));
-        return epv;
-    }
-    public static float Volume {
-        get { float vol; Marshal.ThrowExceptionForHR(Vol().GetMasterVolumeLevelScalar(out vol)); return vol; }
-        set { Marshal.ThrowExceptionForHR(Vol().SetMasterVolumeLevelScalar(value, System.Guid.Empty)); }
-    }
-    public static bool Mute {
-        get { bool mute; Marshal.ThrowExceptionForHR(Vol().GetMute(out mute)); return mute; }
-        set { Marshal.ThrowExceptionForHR(Vol().SetMute(value, System.Guid.Empty)); }
-    }
+	var enumerator uintptr
+	ret, _, _ := procCoCreateInstance.Call(
+		uintptr(unsafe.Pointer(&CLSID_MMDeviceEnumerator)),
+		0,
+		23, // CLSCTX_ALL
+		uintptr(unsafe.Pointer(&IID_IMMDeviceEnumerator)),
+		uintptr(unsafe.Pointer(&enumerator)),
+	)
+	if ret != 0 {
+		return fmt.Errorf("CoCreateInstance failed: HRESULT 0x%X", ret)
+	}
+	defer releaseCOM(enumerator)
+
+	var device uintptr
+	// GetDefaultAudioEndpoint (offset 4)
+	vtable := *(*uintptr)(unsafe.Pointer(enumerator))
+	fn := *(*uintptr)(unsafe.Pointer(vtable + 4*unsafe.Sizeof(uintptr(0))))
+	ret, _, _ = syscall.SyscallN(fn, enumerator, 0, 0, uintptr(unsafe.Pointer(&device)))
+	if ret != 0 {
+		return fmt.Errorf("GetDefaultAudioEndpoint failed: HRESULT 0x%X", ret)
+	}
+	defer releaseCOM(device)
+
+	var endpointVolume uintptr
+	// Activate (offset 3)
+	vtable = *(*uintptr)(unsafe.Pointer(device))
+	fn = *(*uintptr)(unsafe.Pointer(vtable + 3*unsafe.Sizeof(uintptr(0))))
+	ret, _, _ = syscall.SyscallN(fn, device, uintptr(unsafe.Pointer(&IID_IAudioEndpointVolume)), 23, 0, uintptr(unsafe.Pointer(&endpointVolume)))
+	if ret != 0 {
+		return fmt.Errorf("Activate failed: HRESULT 0x%X", ret)
+	}
+	defer releaseCOM(endpointVolume)
+
+	vtable = *(*uintptr)(unsafe.Pointer(endpointVolume))
+	if mute != nil {
+		// SetMute (offset 14)
+		var val uintptr = 0
+		if *mute {
+			val = 1
+		}
+		fn = *(*uintptr)(unsafe.Pointer(vtable + 14*unsafe.Sizeof(uintptr(0))))
+		ret, _, _ = syscall.SyscallN(fn, endpointVolume, val, 0)
+		if ret != 0 {
+			return fmt.Errorf("SetMute failed: HRESULT 0x%X", ret)
+		}
+	} else {
+		// SetMasterVolumeLevelScalar (offset 7)
+		fn = *(*uintptr)(unsafe.Pointer(vtable + 7*unsafe.Sizeof(uintptr(0))))
+		ret = syscallVolume(fn, endpointVolume, volume, 0)
+		if ret != 0 {
+			return fmt.Errorf("SetMasterVolumeLevelScalar failed: HRESULT 0x%X", ret)
+		}
+	}
+
+	return nil
 }
-"@
-`
-	return base + "\n" + action
+
+func releaseCOM(obj uintptr) {
+	if obj == 0 {
+		return
+	}
+	vtable := *(*uintptr)(unsafe.Pointer(obj))
+	fn := *(*uintptr)(unsafe.Pointer(vtable + 2*unsafe.Sizeof(uintptr(0)))) // Release is offset 2
+	syscall.SyscallN(fn, obj)
 }
 
 // SetVolume sets the master system volume (0 to 100).
@@ -98,17 +152,10 @@ func SetVolume(percent int) error {
 		percent = 100
 	}
 	val := float32(percent) / 100.0
-	action := fmt.Sprintf("[Audio]::Volume = %.2f", val)
-	return runPowerShell(getVolumeScript(action))
+	return setVolumeCOM(val, nil)
 }
 
 // SetMute sets the master system mute state.
 func SetMute(mute bool) error {
-	var action string
-	if mute {
-		action = "[Audio]::Mute = $true"
-	} else {
-		action = "[Audio]::Mute = $false"
-	}
-	return runPowerShell(getVolumeScript(action))
+	return setVolumeCOM(0.0, &mute)
 }
