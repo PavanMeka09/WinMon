@@ -4,6 +4,9 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"winmon/internal/device"
 )
@@ -22,29 +25,55 @@ type Config struct {
 	CommandTimeoutSeconds int      `json:"command_timeout_seconds"`
 }
 
-func LoadConfig() (*Config, error) {
-	// 1. Try embedded FS (config.json first, then config.json.template)
-	var data []byte
-	var loadedFromEmbedded bool
+func isValidToken(token string) bool {
+	t := strings.TrimSpace(token)
+	return t != "" && t != "YOUR_DISCORD_BOT_TOKEN" && t != "YOUR_TELEGRAM_BOT_TOKEN"
+}
 
-	if bytes, err := configFS.ReadFile("config.json"); err == nil {
-		var tempCfg Config
-		if err := json.Unmarshal(bytes, &tempCfg); err == nil {
-			if tempCfg.BotToken != "" && tempCfg.BotToken != "YOUR_DISCORD_BOT_TOKEN" && tempCfg.BotToken != "YOUR_TELEGRAM_BOT_TOKEN" {
+func LoadConfig() (*Config, error) {
+	var data []byte
+
+	// 1. Try external config.json in executable directory
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		extPath := filepath.Join(exeDir, "config.json")
+		if bytes, err := os.ReadFile(extPath); err == nil {
+			var tempCfg Config
+			if err := json.Unmarshal(bytes, &tempCfg); err == nil && isValidToken(tempCfg.BotToken) {
 				data = bytes
-				loadedFromEmbedded = true
 			}
 		}
 	}
 
-	if !loadedFromEmbedded {
+	// 2. Try external config.json in working directory
+	if len(data) == 0 {
+		if bytes, err := os.ReadFile("config.json"); err == nil {
+			var tempCfg Config
+			if err := json.Unmarshal(bytes, &tempCfg); err == nil && isValidToken(tempCfg.BotToken) {
+				data = bytes
+			}
+		}
+	}
+
+	// 3. Try embedded FS config.json
+	if len(data) == 0 {
+		if bytes, err := configFS.ReadFile("config.json"); err == nil {
+			var tempCfg Config
+			if err := json.Unmarshal(bytes, &tempCfg); err == nil && isValidToken(tempCfg.BotToken) {
+				data = bytes
+			}
+		}
+	}
+
+	// 4. Fallback to embedded template
+	if len(data) == 0 {
 		if bytes, err := configFS.ReadFile("config.json.template"); err == nil {
 			data = bytes
 		}
 	}
 
 	if len(data) == 0 {
-		return nil, errors.New("no configuration data found in embedded filesystem")
+		return nil, errors.New("no configuration data found")
 	}
 
 	var cfg Config
@@ -52,9 +81,8 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
-	// If the loaded configuration from template has no token, it means we have no valid config at all.
-	if cfg.BotToken == "" || cfg.BotToken == "YOUR_DISCORD_BOT_TOKEN" || cfg.BotToken == "YOUR_TELEGRAM_BOT_TOKEN" {
-		return nil, errors.New("no valid configuration found embedded")
+	if !isValidToken(cfg.BotToken) {
+		return nil, errors.New("invalid or missing bot_token in configuration")
 	}
 
 	// Dynamically override DeviceName and DeviceID
@@ -63,3 +91,4 @@ func LoadConfig() (*Config, error) {
 
 	return &cfg, nil
 }
+

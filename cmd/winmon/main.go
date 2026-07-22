@@ -9,10 +9,24 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"golang.org/x/sys/windows"
+
 	"winmon/internal/bot"
 	"winmon/internal/config"
 	"winmon/internal/service"
 )
+
+func showMsgBox(title, msg string, isError bool) {
+	titlePtr, _ := windows.UTF16PtrFromString(title)
+	msgPtr, _ := windows.UTF16PtrFromString(msg)
+	var style uint32 = windows.MB_OK | windows.MB_SETFOREGROUND
+	if isError {
+		style |= windows.MB_ICONERROR
+	} else {
+		style |= windows.MB_ICONINFORMATION
+	}
+	windows.MessageBox(0, msgPtr, titlePtr, style)
+}
 
 func main() {
 	// Set shared temp directory for Session 0 service <-> Session 1 helper coordination
@@ -40,7 +54,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 2. Session Helper Routing (Backward Compatibility)
+	// 2. Session Helper Routing
 	if *sessionHelper {
 		if *helperCmd == "" {
 			log.Fatal("Missing -cmd argument for session helper")
@@ -52,16 +66,21 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 2. Service administrative actions
+	// 3. Service administrative actions
 	if *serviceAction != "" {
 		err := handleServiceAction(*serviceAction)
 		if err != nil {
-			log.Fatalf("Service action failed: %v", err)
+			log.Printf("Service action failed: %v", err)
+			showMsgBox("WinMon Service Error", fmt.Sprintf("Service action '%s' failed:\n%v", *serviceAction, err), true)
+			os.Exit(1)
+		}
+		if *serviceAction == "install" {
+			showMsgBox("WinMon Setup Complete", "WinMon Service installed and started successfully!\n\nIt is now running in the background as a Windows Service at C:\\Program Files\\WinMon\\winmon.exe.", false)
 		}
 		os.Exit(0)
 	}
 
-	// Auto-registration and startup (if not running as a service and not forced console)
+	// Auto-registration and startup (if double clicked in GUI and not forced console)
 	if !service.IsRunningAsService() && !*consoleMode {
 		const svcName = "WinMon"
 		installed, err := service.IsServiceInstalled(svcName)
@@ -74,6 +93,7 @@ func main() {
 			err := service.ElevateProcess("-service install")
 			if err != nil {
 				log.Printf("Failed to request elevation: %v. Falling back to console mode.", err)
+				showMsgBox("WinMon Setup Error", fmt.Sprintf("Failed to request Administrator privileges:\n%v\n\nFalling back to console mode.", err), true)
 			} else {
 				log.Println("Elevation request sent. Exiting parent process...")
 				os.Exit(0)
@@ -86,6 +106,7 @@ func main() {
 
 			if running {
 				log.Println("WinMon service is already running in the background. Exiting...")
+				showMsgBox("WinMon Service", "WinMon is already installed and running active in the background.", false)
 				os.Exit(0)
 			} else {
 				log.Println("WinMon service is installed but not running. Attempting to start the service...")
@@ -94,22 +115,24 @@ func main() {
 					log.Printf("Failed to start service: %v. Requesting administrator privileges to start the service...", err)
 					errSvc := service.ElevateProcess("-service start")
 					if errSvc != nil {
-						log.Printf("Failed to request elevation: %v. Falling back to console mode.", errSvc)
+						showMsgBox("WinMon Error", fmt.Sprintf("Failed to start service:\n%v", errSvc), true)
 					} else {
-						log.Println("Elevation request sent. Exiting parent process...")
 						os.Exit(0)
 					}
 				} else {
-					log.Println("WinMon service started successfully. Exiting...")
+					showMsgBox("WinMon Service", "WinMon Service started successfully in the background.", false)
 					os.Exit(0)
 				}
 			}
 		}
 	}
 
-	// 3. Normal execution (Service mode or Console mode)
+	// 4. Normal execution (Service mode or Console mode)
 	cfg, err := config.LoadConfig()
 	if err != nil {
+		if !service.IsRunningAsService() && !*consoleMode {
+			showMsgBox("WinMon Configuration Error", fmt.Sprintf("Failed to load config:\n%v\n\nPlease ensure config.json is placed in the same folder as winmon.exe.", err), true)
+		}
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
@@ -184,3 +207,4 @@ func handleServiceAction(action string) error {
 		return fmt.Errorf("unknown service action: %s", action)
 	}
 }
+

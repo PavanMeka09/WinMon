@@ -331,11 +331,18 @@ func InstallService(name, displayName, desc string) error {
 			return fmt.Errorf("failed to copy executable to %s: %w", targetExePath, err)
 		}
 
-		// Optionally copy local state file if it exists in the current folder
+		// Copy config.json and state.json if present in the source folder
 		srcDir := filepath.Dir(exePath)
-		srcFile := filepath.Join(srcDir, "state.json")
-		if _, err := os.Stat(srcFile); err == nil {
-			_ = copyFile(srcFile, filepath.Join(targetDir, "state.json"))
+		srcConfig := filepath.Join(srcDir, "config.json")
+		if _, err := os.Stat(srcConfig); err == nil {
+			_ = copyFile(srcConfig, filepath.Join(targetDir, "config.json"))
+		} else if _, err := os.Stat("config.json"); err == nil {
+			_ = copyFile("config.json", filepath.Join(targetDir, "config.json"))
+		}
+
+		srcState := filepath.Join(srcDir, "state.json")
+		if _, err := os.Stat(srcState); err == nil {
+			_ = copyFile(srcState, filepath.Join(targetDir, "state.json"))
 		}
 
 		exePath = targetExePath
