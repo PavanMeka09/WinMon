@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -304,6 +306,18 @@ func IsRunningAsService() bool {
 	return isSvc
 }
 
+func killExistingTargetProcess() {
+	_ = StopService("WinMon")
+	time.Sleep(300 * time.Millisecond)
+
+	currentPID := os.Getpid()
+	killCmd := fmt.Sprintf("powershell -NoProfile -NonInteractive -Command \"Get-Process winmon -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne %d } | Stop-Process -Force\"", currentPID)
+	c := exec.Command("cmd", "/c", killCmd)
+	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = c.Run()
+	time.Sleep(300 * time.Millisecond)
+}
+
 // Service administration functions
 func InstallService(name, displayName, desc string) error {
 	m, err := mgr.Connect()
@@ -323,6 +337,9 @@ func InstallService(name, displayName, desc string) error {
 
 	// If we are not already running from the target path, copy ourselves there
 	if !strings.EqualFold(exePath, targetExePath) {
+		// Stop any active service or background agent that might lock the destination file
+		killExistingTargetProcess()
+
 		if err := os.MkdirAll(targetDir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
 		}
