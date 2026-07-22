@@ -61,6 +61,10 @@ func RunService(serviceName string, stopChan chan struct{}) error {
 	return svc.Run(serviceName, &WinMonService{StopChan: stopChan})
 }
 
+func LogServiceError(format string, a ...interface{}) {
+	logDebug(format, a...)
+}
+
 func logDebug(format string, a ...interface{}) {
 	f, err := os.OpenFile("C:\\Windows\\Temp\\winmon_service.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {

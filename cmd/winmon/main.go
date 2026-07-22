@@ -83,13 +83,19 @@ func main() {
 	// Auto-registration and startup (if double clicked in GUI and not forced console)
 	if !service.IsRunningAsService() && !*consoleMode {
 		const svcName = "WinMon"
+		targetExePath := `C:\Program Files\WinMon\winmon.exe`
+		targetExists := false
+		if _, err := os.Stat(targetExePath); err == nil {
+			targetExists = true
+		}
+
 		installed, err := service.IsServiceInstalled(svcName)
 		if err != nil {
 			log.Printf("Warning: Failed to check service installation status: %v", err)
 		}
 
-		if !installed {
-			log.Println("WinMon service is not installed. Requesting administrator privileges to install and start the service...")
+		if !installed || !targetExists {
+			log.Println("WinMon service is not installed or binary is missing. Requesting administrator privileges to install...")
 			err := service.ElevateProcess("-service install")
 			if err != nil {
 				log.Printf("Failed to request elevation: %v. Falling back to console mode.", err)
@@ -112,10 +118,10 @@ func main() {
 				log.Println("WinMon service is installed but not running. Attempting to start the service...")
 				err = service.StartService(svcName)
 				if err != nil {
-					log.Printf("Failed to start service: %v. Requesting administrator privileges to start the service...", err)
-					errSvc := service.ElevateProcess("-service start")
+					log.Printf("Failed to start service: %v. Requesting administrator privileges to re-install...", err)
+					errSvc := service.ElevateProcess("-service install")
 					if errSvc != nil {
-						showMsgBox("WinMon Error", fmt.Sprintf("Failed to start service:\n%v", errSvc), true)
+						showMsgBox("WinMon Error", fmt.Sprintf("Failed to install and start service:\n%v", errSvc), true)
 					} else {
 						os.Exit(0)
 					}
@@ -127,43 +133,52 @@ func main() {
 		}
 	}
 
-	// 4. Normal execution (Service mode or Console mode)
+	// 4. Normal execution (Service mode vs Console mode)
+	if service.IsRunningAsService() {
+		stopChan := make(chan struct{})
+
+		go func() {
+			cfg, err := config.LoadConfig()
+			if err != nil {
+				service.LogServiceError("Service config error: %v", err)
+				service.SafeClose(stopChan)
+				return
+			}
+			coordinator := bot.NewBotCoordinator(cfg, stopChan)
+			coordinator.Start()
+		}()
+
+		err := service.RunService("WinMon", stopChan)
+		if err != nil {
+			service.LogServiceError("Service run error: %v", err)
+		}
+		os.Exit(0)
+	}
+
+	// Console mode execution
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		if !service.IsRunningAsService() && !*consoleMode {
-			showMsgBox("WinMon Configuration Error", fmt.Sprintf("Failed to load config:\n%v\n\nPlease ensure config.json is placed in the same folder as winmon.exe.", err), true)
+		if !*consoleMode {
+			showMsgBox("WinMon Configuration Error", fmt.Sprintf("Failed to load config:\n%v\n\nPlease ensure configuration is embedded or config.json is present.", err), true)
 		}
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
 	stopChan := make(chan struct{})
+	log.Println("Starting WinMon in console mode (Press Ctrl+C to stop)...")
 
-	if service.IsRunningAsService() {
-		go func() {
-			coordinator := bot.NewBotCoordinator(cfg, stopChan)
-			coordinator.Start()
-		}()
+	coordinator := bot.NewBotCoordinator(cfg, stopChan)
+	go coordinator.Start()
 
-		err = service.RunService("WinMon", stopChan)
-		if err != nil {
-			log.Fatalf("Service execution failed: %v", err)
-		}
-	} else {
-		log.Println("Starting WinMon in console mode (Press Ctrl+C to stop)...")
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-		coordinator := bot.NewBotCoordinator(cfg, stopChan)
-		go coordinator.Start()
-
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-		select {
-		case <-sigChan:
-			log.Println("Received shutdown signal. Stopping...")
-			close(stopChan)
-		case <-stopChan:
-			log.Println("Bot coordinator requested shutdown. Stopping...")
-		}
+	select {
+	case <-sigChan:
+		log.Println("Received shutdown signal. Stopping...")
+		close(stopChan)
+	case <-stopChan:
+		log.Println("Bot coordinator requested shutdown. Stopping...")
 	}
 }
 
