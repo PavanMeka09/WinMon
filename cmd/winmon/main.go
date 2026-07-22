@@ -17,8 +17,12 @@ import (
 )
 
 func showMsgBox(title, msg string, isError bool) {
-	titlePtr, _ := windows.UTF16PtrFromString(title)
-	msgPtr, _ := windows.UTF16PtrFromString(msg)
+	titlePtr, errTitle := windows.UTF16PtrFromString(title)
+	msgPtr, errMsg := windows.UTF16PtrFromString(msg)
+	if errTitle != nil || errMsg != nil {
+		log.Printf("showMsgBox error: titleErr=%v, msgErr=%v", errTitle, errMsg)
+		return
+	}
 	var style uint32 = windows.MB_OK | windows.MB_SETFOREGROUND
 	if isError {
 		style |= windows.MB_ICONERROR
@@ -59,7 +63,7 @@ func main() {
 		if *helperCmd == "" {
 			log.Fatal("Missing -cmd argument for session helper")
 		}
-		err := bot.RunSessionHelper(*helperCmd, *helperArgs)
+		err := bot.RunSessionHelper(*helperCmd, *helperArgs, "")
 		if err != nil {
 			log.Fatalf("Session helper error: %v", err)
 		}
@@ -222,4 +226,3 @@ func handleServiceAction(action string) error {
 		return fmt.Errorf("unknown service action: %s", action)
 	}
 }
-

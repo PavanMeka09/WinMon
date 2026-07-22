@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -13,9 +14,10 @@ import (
 const PipeName = `\\.\pipe\WinMonIPC`
 
 type IPCRequest struct {
-	Cmd      string   `json:"cmd"`
-	Args     []string `json:"args"`
-	FlatArgs string   `json:"flat_args"`
+	Cmd        string   `json:"cmd"`
+	Args       []string `json:"args"`
+	FlatArgs   string   `json:"flat_args"`
+	OutputFile string   `json:"output_file,omitempty"`
 }
 
 type IPCResponse struct {
@@ -27,13 +29,26 @@ type IPCResponse struct {
 
 var ipcMu sync.Mutex
 
+func createPipeSecurityAttributes() *windows.SecurityAttributes {
+	sd, err := windows.SecurityDescriptorFromString("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)")
+	if err != nil {
+		logDebug("SecurityDescriptorFromString error: %v", err)
+		return nil
+	}
+	var sa windows.SecurityAttributes
+	sa.Length = uint32(unsafe.Sizeof(sa))
+	sa.SecurityDescriptor = sd
+	sa.InheritHandle = 0
+	return &sa
+}
+
 // SendIPCCommand is called by the Service (Session 0) to send a command request to the Persistent User Agent (Session 1) over Named Pipe IPC.
 func SendIPCCommand(req IPCRequest, timeout time.Duration) (*IPCResponse, error) {
+	// Ensure the User Agent is active in Session 1 (guarded by mutex)
 	ipcMu.Lock()
-	defer ipcMu.Unlock()
-
-	// Ensure the User Agent is active in Session 1
-	if err := EnsureUserAgentRunning(); err != nil {
+	err := EnsureUserAgentRunning()
+	ipcMu.Unlock()
+	if err != nil {
 		return nil, fmt.Errorf("failed to ensure user agent is running: %w", err)
 	}
 
@@ -88,6 +103,8 @@ func StartIPCAgentServer(handler func(req IPCRequest) IPCResponse) error {
 		return err
 	}
 
+	sa := createPipeSecurityAttributes()
+
 	for {
 		hPipe, err := windows.CreateNamedPipe(
 			pipeNameUTF16,
@@ -97,7 +114,7 @@ func StartIPCAgentServer(handler func(req IPCRequest) IPCResponse) error {
 			65536,
 			65536,
 			0,
-			nil,
+			sa,
 		)
 		if err != nil {
 			logDebug("CreateNamedPipe failed: %v", err)
@@ -112,8 +129,8 @@ func StartIPCAgentServer(handler func(req IPCRequest) IPCResponse) error {
 			continue
 		}
 
-		// Handle request in a closure to ensure cleanup per connection
-		func(h windows.Handle) {
+		// Handle request concurrently in a goroutine
+		go func(h windows.Handle) {
 			pipeFile := os.NewFile(uintptr(h), PipeName)
 			defer func() {
 				windows.DisconnectNamedPipe(h)

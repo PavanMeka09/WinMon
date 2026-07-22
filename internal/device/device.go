@@ -231,7 +231,7 @@ func GetComputerUUID() string {
 
 	// Fallback to FNV hash of hostname to guarantee a stable, unique ID
 	name := GetComputerName()
-	importHash := func(s string) string {
+	fnvHash := func(s string) string {
 		var sum uint32 = 2166136261
 		for i := 0; i < len(s); i++ {
 			sum ^= uint32(s[i])
@@ -239,5 +239,5 @@ func GetComputerUUID() string {
 		}
 		return fmt.Sprintf("fallback-%08x", sum)
 	}
-	return importHash(name)
+	return fnvHash(name)
 }

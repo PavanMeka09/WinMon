@@ -81,7 +81,10 @@ func ZipDirectory(sourceDir, zipPath string) error {
 		}
 		defer file.Close()
 
-		_, _ = io.Copy(writer, file)
+		_, copyErr := io.Copy(writer, file)
+		if copyErr != nil {
+			return copyErr
+		}
 		return nil
 	})
 

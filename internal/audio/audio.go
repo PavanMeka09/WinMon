@@ -60,14 +60,20 @@ func PlaySoundLocal(path string) error {
 	openCmd := fmt.Sprintf("open \"%s\" type mpegvideo alias myaudio", path)
 	openPtr, err := syscall.UTF16PtrFromString(openCmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid open command string: %w", err)
 	}
 	procMciSendStringW.Call(uintptr(unsafe.Pointer(openPtr)), 0, 0, 0)
 
-	playPtr, _ := syscall.UTF16PtrFromString("play myaudio wait")
+	playPtr, err := syscall.UTF16PtrFromString("play myaudio wait")
+	if err != nil {
+		return fmt.Errorf("invalid play command string: %w", err)
+	}
 	procMciSendStringW.Call(uintptr(unsafe.Pointer(playPtr)), 0, 0, 0)
 
-	closePtr, _ := syscall.UTF16PtrFromString("close myaudio")
+	closePtr, err := syscall.UTF16PtrFromString("close myaudio")
+	if err != nil {
+		return fmt.Errorf("invalid close command string: %w", err)
+	}
 	procMciSendStringW.Call(uintptr(unsafe.Pointer(closePtr)), 0, 0, 0)
 
 	return nil
