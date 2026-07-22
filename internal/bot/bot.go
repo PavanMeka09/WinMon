@@ -1,23 +1,18 @@
 package bot
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
+
+	"github.com/bwmarrin/discordgo"
 
 	"winmon/internal/audio"
 	"winmon/internal/clipboard"
@@ -30,1054 +25,684 @@ import (
 	"winmon/internal/notifications"
 	"winmon/internal/service"
 	"winmon/internal/shell"
-	"winmon/internal/updater"
 )
 
-// State structures for pinned message coordination
-type DeviceState struct {
-	DeviceName string    `json:"device_name"`
-	Group      string    `json:"group"`
-	Version    string    `json:"version"`
-	LastSeen   time.Time `json:"last_seen"`
-	Status     string    `json:"status"` // "online"
-}
-
-type CommandState struct {
-	Command      string    `json:"command"`
-	TargetDevice string    `json:"target_device,omitempty"`
-	Args         []string  `json:"args"`
-	Timestamp    time.Time `json:"timestamp"`
-	FileID       string    `json:"file_id,omitempty"`
-	FileName     string    `json:"file_name,omitempty"`
-}
-
-type PinnedState struct {
-	ActivePoller     string                 `json:"active_poller"`
-	SelectedDevice   string                 `json:"selected_device"`
-	Devices          map[string]DeviceState `json:"devices"`
-	PendingCommand   *CommandState          `json:"pending_command,omitempty"`
-	BroadcastCommand *CommandState          `json:"broadcast_command,omitempty"`
-}
-
-type LocalState struct {
-	ChatID          int64 `json:"chat_id"`
-	PinnedMessageID int64 `json:"pinned_message_id"`
-}
-
-type LastMsgState struct {
-	ID      int64
-	Text    string
-	IsMedia bool
-}
-
 type BotCoordinator struct {
-	cfg           *config.Config
-	client        *http.Client
-	statePath     string
-	localState    *LocalState
-	mu            sync.Mutex
-	stopChan      chan struct{}
-	lastErrTime   time.Time
-	isPoller      bool
-	lastBroadcast time.Time
-	lastMsgs      map[int64]*LastMsgState
-	lastMsgsMu    sync.Mutex
+	cfg      *config.Config
+	session  *discordgo.Session
+	stopChan chan struct{}
 }
 
 func NewBotCoordinator(cfg *config.Config, stopChan chan struct{}) *BotCoordinator {
-	var statePath string
-	if service.IsRunningAsService() {
-		exePath, _ := os.Executable()
-		statePath = filepath.Join(filepath.Dir(exePath), "state.json")
-	} else {
-		statePath = "state.json"
-	}
-
 	return &BotCoordinator{
-		cfg:       cfg,
-		client:    &http.Client{Timeout: 30 * time.Second},
-		statePath: statePath,
-		stopChan:  stopChan,
-		lastMsgs:  make(map[int64]*LastMsgState),
+		cfg:      cfg,
+		stopChan: stopChan,
 	}
 }
 
-// HTTP requests helper
-func (b *BotCoordinator) request(method string, payload interface{}) ([]byte, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", b.cfg.BotToken, method)
-	var body io.Reader
-
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		body = bytes.NewBuffer(data)
-	}
-
-	req, err := http.NewRequest("POST", url, body)
-	if err != nil {
-		return nil, err
-	}
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	return respBody, nil
-}
-
-// Local State management
-func (b *BotCoordinator) getLocalState() *LocalState {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.localState == nil {
-		return nil
-	}
-	return &LocalState{
-		ChatID:          b.localState.ChatID,
-		PinnedMessageID: b.localState.PinnedMessageID,
-	}
-}
-
-func (b *BotCoordinator) loadLocalState() error {
-	data, err := os.ReadFile(b.statePath)
-	if err != nil {
-		return err
-	}
-	var ls LocalState
-	if err := json.Unmarshal(data, &ls); err != nil {
-		return err
-	}
-	b.mu.Lock()
-	b.localState = &ls
-	b.mu.Unlock()
-	return nil
-}
-
-func (b *BotCoordinator) saveLocalState(chatID, msgID int64) error {
-	ls := LocalState{ChatID: chatID, PinnedMessageID: msgID}
-	data, err := json.MarshalIndent(ls, "", "  ")
-	if err != nil {
-		return err
-	}
-	b.mu.Lock()
-	b.localState = &ls
-	b.mu.Unlock()
-	return os.WriteFile(b.statePath, data, 0644)
-}
-
-var (
-	ErrNoPinnedState      = errors.New("no pinned message found in chat")
-	ErrInvalidPinnedState = errors.New("no json state block found or invalid format in pinned message")
-)
-
-// Telegram Pinned State management
-func (b *BotCoordinator) getPinnedState() (*PinnedState, error) {
-	ls := b.getLocalState()
-	if ls == nil {
-		return nil, fmt.Errorf("local state not loaded")
-	}
-
-	type GetChatReq struct {
-		ChatID int64 `json:"chat_id"`
-	}
-	respBytes, err := b.request("getChat", GetChatReq{ChatID: ls.ChatID})
-	if err != nil {
-		return nil, err
-	}
-
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			PinnedMessage struct {
-				MessageID int64  `json:"message_id"`
-				Text      string `json:"text"`
-			} `json:"pinned_message"`
-		} `json:"result"`
-	}
-
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		return nil, err
-	}
-
-	if wrapper.Result.PinnedMessage.MessageID == 0 {
-		return nil, ErrNoPinnedState
-	}
-
-	text := wrapper.Result.PinnedMessage.Text
-	// Find JSON block within message
-	startIdx := strings.Index(text, "{")
-	if startIdx == -1 {
-		return nil, ErrInvalidPinnedState
-	}
-	endIdx := strings.LastIndex(text, "}")
-	if endIdx == -1 || endIdx <= startIdx {
-		return nil, ErrInvalidPinnedState
-	}
-
-	var state PinnedState
-	if err := json.Unmarshal([]byte(text[startIdx:endIdx+1]), &state); err != nil {
-		return nil, ErrInvalidPinnedState
-	}
-
-	// Only update local state if the pinned message ID changed AND it is a valid WinMon state
-	if wrapper.Result.PinnedMessage.MessageID != ls.PinnedMessageID {
-		_ = b.saveLocalState(ls.ChatID, wrapper.Result.PinnedMessage.MessageID)
-	}
-
-	return &state, nil
-}
-
-func (b *BotCoordinator) updatePinnedState(state *PinnedState) error {
-	ls := b.getLocalState()
-	if ls == nil {
-		return fmt.Errorf("local state not loaded")
-	}
-
-	stateJSON, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	text := fmt.Sprintf("WinMon Coordination Mesh Status:\n```json\n%s\n```\nDo not unpin or modify.", string(stateJSON))
-
-	type EditMsgReq struct {
-		ChatID    int64  `json:"chat_id"`
-		MessageID int64  `json:"message_id"`
-		Text      string `json:"text"`
-		ParseMode string `json:"parse_mode"`
-	}
-
-	_, err = b.request("editMessageText", EditMsgReq{
-		ChatID:    ls.ChatID,
-		MessageID: ls.PinnedMessageID,
-		Text:      text,
-		ParseMode: "Markdown",
-	})
-	return err
-}
-
-func (b *BotCoordinator) createPinnedState(chatID int64) error {
-	state := PinnedState{
-		ActivePoller:   b.cfg.DeviceID,
-		SelectedDevice: b.cfg.DeviceID,
-		Devices:        make(map[string]DeviceState),
-	}
-	state.Devices[b.cfg.DeviceID] = DeviceState{
-		DeviceName: b.cfg.DeviceName,
-		Group:      b.cfg.Group,
-		Version:    b.cfg.Version,
-		LastSeen:   time.Now(),
-		Status:     "online",
-	}
-
-	stateJSON, _ := json.MarshalIndent(state, "", "  ")
-	text := fmt.Sprintf("WinMon Coordination Mesh Status:\n```json\n%s\n```\nDo not unpin or modify.", string(stateJSON))
-
-	type SendMsgReq struct {
-		ChatID    int64  `json:"chat_id"`
-		Text      string `json:"text"`
-		ParseMode string `json:"parse_mode"`
-	}
-
-	respBytes, err := b.request("sendMessage", SendMsgReq{
-		ChatID:    chatID,
-		Text:      text,
-		ParseMode: "Markdown",
-	})
-	if err != nil {
-		return err
-	}
-
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			MessageID int64 `json:"message_id"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		return err
-	}
-
-	// Pin it
-	type PinReq struct {
-		ChatID    int64 `json:"chat_id"`
-		MessageID int64 `json:"message_id"`
-	}
-	_, err = b.request("pinChatMessage", PinReq{
-		ChatID:    chatID,
-		MessageID: wrapper.Result.MessageID,
-	})
-	if err != nil {
-		return err
-	}
-
-	return b.saveLocalState(chatID, wrapper.Result.MessageID)
-}
-
-// Telegram messaging helpers
-func (b *BotCoordinator) sendMessage(chatID int64, text string, replyTo int64) int64 {
-	type SendMsgReq struct {
-		ChatID           int64  `json:"chat_id"`
-		Text             string `json:"text"`
-		ParseMode        string `json:"parse_mode"`
-		ReplyToMessageID int64  `json:"reply_to_message_id,omitempty"`
-	}
-	req := SendMsgReq{
-		ChatID:    chatID,
-		Text:      text,
-		ParseMode: "Markdown",
-	}
-	if replyTo > 0 {
-		req.ReplyToMessageID = replyTo
-	}
-	respBytes, err := b.request("sendMessage", req)
-	if err != nil {
-		return 0
-	}
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			MessageID int64 `json:"message_id"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		return 0
-	}
-
-	b.lastMsgsMu.Lock()
-	b.lastMsgs[replyTo] = &LastMsgState{
-		ID:      wrapper.Result.MessageID,
-		Text:    text,
-		IsMedia: false,
-	}
-	b.lastMsgsMu.Unlock()
-
-	return wrapper.Result.MessageID
-}
-
-func (b *BotCoordinator) sendChatAction(chatID int64, action string) {
-	type ActionReq struct {
-		ChatID int64  `json:"chat_id"`
-		Action string `json:"action"`
-	}
-	b.request("sendChatAction", ActionReq{ChatID: chatID, Action: action})
-}
-
-func (b *BotCoordinator) sendFile(chatID int64, method string, paramName string, filePath string, replyTo int64) (int64, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	_ = writer.WriteField("chat_id", strconv.FormatInt(chatID, 10))
-	if replyTo > 0 {
-		_ = writer.WriteField("reply_to_message_id", strconv.FormatInt(replyTo, 10))
-	}
-
-	part, err := writer.CreateFormFile(paramName, filepath.Base(filePath))
-	if err != nil {
-		return 0, err
-	}
-	_, err = io.Copy(part, file)
-	if err != nil {
-		return 0, err
-	}
-
-	err = writer.Close()
-	if err != nil {
-		return 0, err
-	}
-
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", b.cfg.BotToken, method)
-	req, err := http.NewRequest("POST", url, body)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	resp, err := b.client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("telegram returned status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			MessageID int64 `json:"message_id"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respBody, &wrapper); err != nil {
-		return 0, err
-	}
-
-	b.lastMsgsMu.Lock()
-	b.lastMsgs[replyTo] = &LastMsgState{
-		ID:      wrapper.Result.MessageID,
-		Text:    "",
-		IsMedia: true,
-	}
-	b.lastMsgsMu.Unlock()
-
-	return wrapper.Result.MessageID, nil
-}
-
-// Run loop
 func (b *BotCoordinator) Start() {
-	err := b.loadLocalState()
+	dg, err := discordgo.New("Bot " + b.cfg.BotToken)
 	if err != nil {
-		// Bootstrap Mode: Poll getUpdates directly until we receive an authorized message
-		b.runBootstrapLoop()
-	} else {
-		b.runMeshLoop()
+		log.Fatalf("Failed to create Discord session: %v", err)
 	}
+	b.session = dg
+
+	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsDirectMessages | discordgo.IntentsMessageContent
+
+	dg.AddHandler(b.handleInteraction)
+	dg.AddHandler(b.handleMessageCreate)
+
+	err = dg.Open()
+	if err != nil {
+		log.Fatalf("Failed to open Discord websocket connection: %v", err)
+	}
+	defer dg.Close()
+
+	log.Printf("🟢 WinMon Discord Bot connected successfully as %s#%s (Device: %s)",
+		dg.State.User.Username, dg.State.User.Discriminator, b.cfg.DeviceName)
+
+	// Register Slash Commands
+	b.registerSlashCommands()
+
+	<-b.stopChan
+	log.Println("Stopping WinMon Discord Bot...")
 }
 
-func (b *BotCoordinator) runBootstrapLoop() {
-	offset := int64(0)
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-b.stopChan:
-			if offset > 0 {
-				_, _, _ = b.getUpdates(offset, 0)
-			}
-			return
-		default:
-			updates, newOffset, err := b.getUpdates(offset, 15)
-			if err != nil {
-				log.Printf("Error getting updates in bootstrap: %v", err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			offset = newOffset
-
-			for _, u := range updates {
-				if u.Message == nil {
-					continue
-				}
-				if !b.isUserAuthorized(u.Message.From.ID) {
-					continue
-				}
-
-				// Received authorized message! Create the mesh state
-				err := b.createPinnedState(u.Message.Chat.ID)
-				if err == nil {
-					b.sendMessage(u.Message.Chat.ID, "WinMon successfully bootstrapped on this PC. Added to coordination mesh.", 0)
-					go b.runMeshLoop()
-					return
-				} else {
-					b.sendMessage(u.Message.Chat.ID, fmt.Sprintf("Failed to initialize pinned mesh status: %v", err), 0)
-				}
-			}
-			time.Sleep(1 * time.Second)
-		}
+func (b *BotCoordinator) isAuthorized(userID string) bool {
+	if len(b.cfg.AllowedUsers) == 0 {
+		return true
 	}
-}
-
-func (b *BotCoordinator) runMeshLoop() {
-	pollerTicker := time.NewTicker(5 * time.Second)
-	workerTicker := time.NewTicker(2 * time.Second)
-	heartbeatTicker := time.NewTicker(15 * time.Second)
-	defer pollerTicker.Stop()
-	defer workerTicker.Stop()
-	defer heartbeatTicker.Stop()
-
-	// Initial registration
-	b.sendHeartbeat()
-
-	offset := int64(0)
-
-	for {
-		select {
-		case <-b.stopChan:
-			if offset > 0 {
-				_, _, _ = b.getUpdates(offset, 0)
-			}
-			return
-		case <-heartbeatTicker.C:
-			b.sendHeartbeat()
-		default:
-			// 1. Determine role
-			role, err := b.checkRole()
-			if err != nil {
-				log.Printf("Error checking role: %v", err)
-				ls := b.getLocalState()
-				if ls != nil && (errors.Is(err, ErrNoPinnedState) || errors.Is(err, ErrInvalidPinnedState)) {
-					log.Println("Pinned state is missing or invalid. Re-initializing pinned state...")
-					if initErr := b.createPinnedState(ls.ChatID); initErr != nil {
-						log.Printf("Failed to re-initialize pinned state: %v", initErr)
-					} else {
-						log.Println("Pinned state successfully re-initialized.")
-					}
-				}
-				time.Sleep(3 * time.Second)
-				continue
-			}
-
-			if role == "poller" {
-				b.isPoller = true
-				updates, newOffset, err := b.getUpdates(offset, 15)
-				if err != nil {
-					log.Printf("Error getting updates: %v", err)
-					time.Sleep(3 * time.Second)
-					continue
-				}
-				offset = newOffset
-
-				for _, u := range updates {
-					if u.Message == nil {
-						continue
-					}
-					if !b.isUserAuthorized(u.Message.From.ID) {
-						continue
-					}
-					b.handleMessage(u.Message)
-				}
-			} else {
-				b.isPoller = false
-				// Worker mode: poll pinned state
-				b.pollPinnedState()
-				time.Sleep(2 * time.Second)
-			}
-		}
-	}
-}
-
-func (b *BotCoordinator) isUserAuthorized(userID int64) bool {
 	for _, id := range b.cfg.AllowedUsers {
-		if id == userID {
+		if strings.TrimSpace(id) == userID {
 			return true
 		}
 	}
 	return false
 }
 
-func (b *BotCoordinator) sendHeartbeat() {
-	state, err := b.getPinnedState()
+func (b *BotCoordinator) registerSlashCommands() {
+	commands := []*discordgo.ApplicationCommand{
+		{
+			Name:        "help",
+			Description: "Display WinMon Control Panel & Available Commands",
+		},
+		{
+			Name:        "deviceinfo",
+			Description: "Display system metrics and hardware info",
+		},
+		{
+			Name:        "screenshot",
+			Description: "Capture primary display screenshot",
+		},
+		{
+			Name:        "webcam",
+			Description: "Capture photo from active webcam",
+		},
+		{
+			Name:        "screenrecord",
+			Description: "Record screen activity as GIF",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "duration",
+					Description: "Duration in seconds (default: 5)",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "listen",
+			Description: "Record microphone audio",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "duration",
+					Description: "Duration in seconds (default: 5)",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "cmd",
+			Description: "Execute shell command",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "command",
+					Description: "Shell command to execute",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "processes",
+			Description: "List running processes",
+		},
+		{
+			Name:        "kill",
+			Description: "Kill process by PID or name",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "target",
+					Description: "Process PID or process name (e.g. 1234 or notepad.exe)",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "download",
+			Description: "Download file from PC",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "filepath",
+					Description: "Full local file path on PC",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "upload",
+			Description: "Upload file to PC",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionAttachment,
+					Name:        "file",
+					Description: "File to upload",
+					Required:    true,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "destination",
+					Description: "Destination folder or file path",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "tts",
+			Description: "Speak text aloud on PC speakers",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "text",
+					Description: "Text message to speak",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "playsound",
+			Description: "Play audio file on PC",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionAttachment,
+					Name:        "file",
+					Description: "Audio file to play",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "path",
+					Description: "Local audio file path on PC",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "wallpaper",
+			Description: "Get current desktop wallpaper image",
+		},
+		{
+			Name:        "setwallpaper",
+			Description: "Set desktop wallpaper image",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionAttachment,
+					Name:        "file",
+					Description: "Wallpaper image file",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "path",
+					Description: "Local image path on PC",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "notify",
+			Description: "Display desktop notification toast",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "message",
+					Description: "Notification message",
+					Required:    true,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "title",
+					Description: "Notification title",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "type",
+			Description: "Type text into active window",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "text",
+					Description: "Text to type",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "keypress",
+			Description: "Press keyboard key",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "key",
+					Description: "Key name (e.g. enter, esc, space, tab, backspace)",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "hotkey",
+			Description: "Trigger keyboard hotkey combo",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "combo",
+					Description: "Hotkey combo (e.g. ctrl+alt+del, win+d, alt+f4)",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "mouse",
+			Description: "Simulate mouse actions",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "action",
+					Description: "Mouse action (click, rightclick, doubleclick, move, scroll)",
+					Required:    true,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "Click", Value: "click"},
+						{Name: "Right Click", Value: "rightclick"},
+						{Name: "Double Click", Value: "doubleclick"},
+						{Name: "Move", Value: "move"},
+						{Name: "Scroll", Value: "scroll"},
+					},
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "x",
+					Description: "X coordinate (for move)",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "y",
+					Description: "Y coordinate or scroll amount",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "clipboard",
+			Description: "Get desktop clipboard content",
+		},
+		{
+			Name:        "setclipboard",
+			Description: "Set clipboard content",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "text",
+					Description: "Text to copy to clipboard",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "brightness",
+			Description: "Adjust display brightness",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "level",
+					Description: "Brightness level (0-100)",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "setvol",
+			Description: "Set system audio volume",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "level",
+					Description: "Volume level (0-100)",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "mute",
+			Description: "Mute system audio",
+		},
+		{
+			Name:        "unmute",
+			Description: "Unmute system audio",
+		},
+	}
+
+	appID := b.session.State.User.ID
+	for _, cmd := range commands {
+		_, err := b.session.ApplicationCommandCreate(appID, b.cfg.GuildID, cmd)
+		if err != nil {
+			log.Printf("Warning: Failed to register slash command /%s: %v", cmd.Name, err)
+		}
+	}
+}
+
+func (b *BotCoordinator) handleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	userID := ""
+	if i.Member != nil && i.Member.User != nil {
+		userID = i.Member.User.ID
+	} else if i.User != nil {
+		userID = i.User.ID
+	}
+
+	if !b.isAuthorized(userID) {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "⛔ **Access Denied:** Your Discord user ID is not authorized to control WinMon.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+	}
+
+	// Defer response to avoid 3-second Discord interaction timeout
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
 	if err != nil {
+		log.Printf("Error deferring interaction: %v", err)
 		return
 	}
 
-	ds, ok := state.Devices[b.cfg.DeviceID]
-	if !ok {
-		ds = DeviceState{}
+	switch i.Type {
+	case discordgo.InteractionApplicationCommand:
+		data := i.ApplicationCommandData()
+		b.dispatchSlashCommand(s, i, data)
+	case discordgo.InteractionMessageComponent:
+		data := i.MessageComponentData()
+		b.dispatchButtonComponent(s, i, data.CustomID)
 	}
-	ds.DeviceName = b.cfg.DeviceName
-	ds.Group = b.cfg.Group
-	ds.Version = b.cfg.Version
-	ds.LastSeen = time.Now()
-	ds.Status = "online"
-
-	state.Devices[b.cfg.DeviceID] = ds
-
-	// Prune devices unseen for > 24 hours to stay within Telegram's 4096 character limit
-	now := time.Now()
-	for id, dev := range state.Devices {
-		if id != b.cfg.DeviceID && now.Sub(dev.LastSeen) > 24*time.Hour {
-			delete(state.Devices, id)
-		}
-	}
-
-	// If there's no active poller, or the active poller is offline (> 45s), claim it!
-	if state.ActivePoller == "" {
-		state.ActivePoller = b.cfg.DeviceID
-	} else if state.ActivePoller != b.cfg.DeviceID {
-		ap, ok := state.Devices[state.ActivePoller]
-		if !ok || time.Since(ap.LastSeen) > 45*time.Second {
-			state.ActivePoller = b.cfg.DeviceID
-		}
-	}
-
-	b.updatePinnedState(state)
 }
 
-func (b *BotCoordinator) checkRole() (string, error) {
-	state, err := b.getPinnedState()
-	if err != nil {
-		return "worker", err
+func (b *BotCoordinator) handleMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if m.Author.ID == s.State.User.ID {
+		return
 	}
-	if state.ActivePoller == b.cfg.DeviceID {
-		return "poller", nil
-	}
-	return "worker", nil
-}
-
-func (b *BotCoordinator) pollPinnedState() {
-	state, err := b.getPinnedState()
-	if err != nil {
+	if !b.isAuthorized(m.Author.ID) {
 		return
 	}
 
-	ls := b.getLocalState()
-	if ls == nil {
-		return
-	}
-	chatID := ls.ChatID
-
-	// 1. Check for pending commands targeting us
-	if state.PendingCommand != nil && state.PendingCommand.TargetDevice == b.cfg.DeviceID {
-		cmd := state.PendingCommand.Command
-		args := state.PendingCommand.Args
-		fileID := state.PendingCommand.FileID
-		fileName := state.PendingCommand.FileName
-
-		// Clear pending command from pinned status so we don't execute it repeatedly
-		state.PendingCommand = nil
-		b.updatePinnedState(state)
-
-		runBg := func(f func()) {
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						errText := fmt.Sprintf("🔴 Execution Panicked: %v", r)
-						b.sendMessage(chatID, errText, 0)
-					}
-				}()
-				f()
-			}()
-		}
-
-		if cmd == "/upload" && fileID != "" {
-			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			dest := strings.Join(args, " ")
-			runBg(func() { b.handleDocumentUpload(doc, chatID, 0, dest) })
-		} else if cmd == "/updateservice" && fileID != "" {
-			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			runBg(func() { b.handleServiceUpdate(doc, chatID, 0) })
-		} else if cmd == "/playsound" && fileID != "" {
-			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			runBg(func() { b.handlePlaySound(doc, chatID, 0) })
-		} else if cmd == "/setwallpaper" && fileID != "" {
-			doc := &TelegramDocument{FileID: fileID, FileName: fileName}
-			runBg(func() { b.handleSetWallpaper(doc, chatID, 0) })
-		} else {
-			runBg(func() { b.executeCommandLocally(cmd, args, chatID, 0) })
-		}
-	}
-
-	// 2. Check for broadcast commands we haven't executed yet
-	if state.BroadcastCommand != nil && state.BroadcastCommand.Timestamp.After(b.lastBroadcast) {
-		b.lastBroadcast = state.BroadcastCommand.Timestamp
-		// Run command in background
-		cmd := state.BroadcastCommand.Command
-		args := state.BroadcastCommand.Args
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					errText := fmt.Sprintf("🔴 Broadcast Execution Panicked: %v", r)
-					b.sendMessage(chatID, errText, 0)
-				}
-			}()
-			b.executeCommandLocally(cmd, args, chatID, 0)
-		}()
+	// Handle direct message file attachments if any
+	if len(m.Attachments) > 0 && strings.HasPrefix(m.Content, "/upload") {
+		att := m.Attachments[0]
+		dest := strings.TrimSpace(strings.TrimPrefix(m.Content, "/upload"))
+		b.handleAttachmentUpload(s, m.ChannelID, att, dest)
 	}
 }
 
-// Telegram Updates retrieval
-type TelegramUpdate struct {
-	UpdateID int64            `json:"update_id"`
-	Message  *TelegramMessage `json:"message"`
-}
-
-type TelegramMessage struct {
-	MessageID int64             `json:"message_id"`
-	From      TelegramUser      `json:"from"`
-	Chat      TelegramChat      `json:"chat"`
-	Text      string            `json:"text"`
-	Caption   string            `json:"caption,omitempty"`
-	Document  *TelegramDocument `json:"document"`
-}
-
-type TelegramUser struct {
-	ID int64 `json:"id"`
-}
-
-type TelegramChat struct {
-	ID int64 `json:"id"`
-}
-
-type TelegramDocument struct {
-	FileID   string `json:"file_id"`
-	FileName string `json:"file_name"`
-	FileSize int64  `json:"file_size"`
-}
-
-func (b *BotCoordinator) getUpdates(offset int64, timeout int) ([]TelegramUpdate, int64, error) {
-	type GetUpdatesReq struct {
-		Offset  int64 `json:"offset"`
-		Timeout int   `json:"timeout"`
-	}
-	respBytes, err := b.request("getUpdates", GetUpdatesReq{Offset: offset, Timeout: timeout})
-	if err != nil {
-		return nil, offset, err
+func (b *BotCoordinator) dispatchSlashCommand(s *discordgo.Session, i *discordgo.InteractionCreate, data discordgo.ApplicationCommandInteractionData) {
+	cmd := "/" + data.Name
+	optionsMap := make(map[string]*discordgo.ApplicationCommandInteractionDataOption)
+	for _, opt := range data.Options {
+		optionsMap[opt.Name] = opt
 	}
 
-	var wrapper struct {
-		Ok     bool             `json:"ok"`
-		Result []TelegramUpdate `json:"result"`
-	}
-
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		return nil, offset, err
-	}
-
-	newOffset := offset
-	for _, u := range wrapper.Result {
-		if u.UpdateID >= newOffset {
-			newOffset = u.UpdateID + 1
-		}
-	}
-
-	return wrapper.Result, newOffset, nil
-}
-
-// Command dispatch
-func (b *BotCoordinator) handleMessage(msg *TelegramMessage) {
-
-	defer func() {
-		if r := recover(); r != nil {
-			errText := fmt.Sprintf("🔴 Execution Panicked: %v", r)
-			b.sendMessage(msg.Chat.ID, errText, msg.MessageID)
-		}
-	}()
-
-	text := strings.TrimSpace(msg.Text)
-	if text == "" {
-		text = strings.TrimSpace(msg.Caption)
-	}
-	if text == "" {
-		return
-	}
-
-	// Split commands and arguments
-	parts := strings.Fields(text)
-	cmd := strings.ToLower(parts[0])
-	args := parts[1:]
-
-	// Filter commands targeting this or selected PC
-	switch cmd {
-	case "/devices":
-		b.handleDevices(msg.Chat.ID, msg.MessageID)
-		return
-	case "/select":
-		if len(args) < 1 {
-			b.sendMessage(msg.Chat.ID, "Usage: `/select <device_id>`", msg.MessageID)
+	switch data.Name {
+	case "help":
+		b.sendHelpPanel(s, i)
+	case "deviceinfo":
+		info, err := device.GetDeviceInfo(b.cfg.DeviceName, b.cfg.DeviceID, b.cfg.Version)
+		if err != nil {
+			b.sendError(s, i, err)
 			return
 		}
-		b.handleSelect(args[0], msg.Chat.ID, msg.MessageID)
-		return
-	case "/broadcast":
-		if len(args) < 1 {
-			b.sendMessage(msg.Chat.ID, "Usage: `/broadcast <command>`", msg.MessageID)
+		embed := &discordgo.MessageEmbed{
+			Title:       "🖥️ WinMon Device Information",
+			Color:       0x00FF88,
+			Description: fmt.Sprintf("```\n%s\n```", info),
+			Timestamp:   time.Now().Format(time.RFC3339),
+		}
+		b.sendEmbedWithButtons(s, i, embed)
+	case "screenshot":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "webcam":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "screenrecord":
+		dur := "5"
+		if opt, ok := optionsMap["duration"]; ok {
+			dur = strconv.FormatInt(opt.IntValue(), 10)
+		}
+		b.executeCommandLocally(cmd, []string{dur}, s, i)
+	case "listen":
+		dur := "5"
+		if opt, ok := optionsMap["duration"]; ok {
+			dur = strconv.FormatInt(opt.IntValue(), 10)
+		}
+		b.executeCommandLocally(cmd, []string{dur}, s, i)
+	case "cmd":
+		shellCmd := optionsMap["command"].StringValue()
+		b.executeCommandLocally(cmd, []string{shellCmd}, s, i)
+	case "processes":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "kill":
+		target := optionsMap["target"].StringValue()
+		b.executeCommandLocally(cmd, []string{target}, s, i)
+	case "download":
+		filePath := optionsMap["filepath"].StringValue()
+		b.executeCommandLocally(cmd, []string{filePath}, s, i)
+	case "upload":
+		attID := optionsMap["file"].Value.(string)
+		att := data.Resolved.Attachments[attID]
+		dest := ""
+		if opt, ok := optionsMap["destination"]; ok {
+			dest = opt.StringValue()
+		}
+		b.handleAttachmentUploadInteraction(s, i, att, dest)
+	case "tts":
+		text := optionsMap["text"].StringValue()
+		b.executeCommandLocally(cmd, []string{text}, s, i)
+	case "playsound":
+		if opt, ok := optionsMap["file"]; ok {
+			attID := opt.Value.(string)
+			att := data.Resolved.Attachments[attID]
+			b.handlePlaySoundAttachment(s, i, att)
+		} else if opt, ok := optionsMap["path"]; ok {
+			b.executeCommandLocally(cmd, []string{opt.StringValue()}, s, i)
+		} else {
+			b.sendText(s, i, "Please provide either a `file` attachment or a `path` parameter.")
+		}
+	case "wallpaper":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "setwallpaper":
+		if opt, ok := optionsMap["file"]; ok {
+			attID := opt.Value.(string)
+			att := data.Resolved.Attachments[attID]
+			b.handleSetWallpaperAttachment(s, i, att)
+		} else if opt, ok := optionsMap["path"]; ok {
+			b.executeCommandLocally(cmd, []string{opt.StringValue()}, s, i)
+		} else {
+			b.sendText(s, i, "Please provide either a `file` attachment or a `path` parameter.")
+		}
+	case "notify":
+		msg := optionsMap["message"].StringValue()
+		title := "WinMon Notification"
+		if opt, ok := optionsMap["title"]; ok {
+			title = opt.StringValue()
+		}
+		b.executeCommandLocally(cmd, []string{title + "|" + msg}, s, i)
+	case "type":
+		text := optionsMap["text"].StringValue()
+		b.executeCommandLocally(cmd, []string{text}, s, i)
+	case "keypress":
+		key := optionsMap["key"].StringValue()
+		b.executeCommandLocally(cmd, []string{key}, s, i)
+	case "hotkey":
+		combo := optionsMap["combo"].StringValue()
+		b.executeCommandLocally(cmd, []string{combo}, s, i)
+	case "mouse":
+		action := optionsMap["action"].StringValue()
+		args := []string{action}
+		if opt, ok := optionsMap["x"]; ok {
+			args = append(args, strconv.FormatInt(opt.IntValue(), 10))
+		}
+		if opt, ok := optionsMap["y"]; ok {
+			args = append(args, strconv.FormatInt(opt.IntValue(), 10))
+		}
+		b.executeCommandLocally(cmd, args, s, i)
+	case "clipboard":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "setclipboard":
+		text := optionsMap["text"].StringValue()
+		b.executeCommandLocally(cmd, []string{text}, s, i)
+	case "brightness":
+		level := strconv.FormatInt(optionsMap["level"].IntValue(), 10)
+		b.executeCommandLocally(cmd, []string{level}, s, i)
+	case "setvol":
+		level := strconv.FormatInt(optionsMap["level"].IntValue(), 10)
+		b.executeCommandLocally(cmd, []string{level}, s, i)
+	case "mute":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "unmute":
+		b.executeCommandLocally(cmd, nil, s, i)
+	}
+}
+
+func (b *BotCoordinator) dispatchButtonComponent(s *discordgo.Session, i *discordgo.InteractionCreate, customID string) {
+	switch customID {
+	case "btn_screenshot":
+		b.executeCommandLocally("/screenshot", nil, s, i)
+	case "btn_processes":
+		b.executeCommandLocally("/processes", nil, s, i)
+	case "btn_deviceinfo":
+		info, err := device.GetDeviceInfo(b.cfg.DeviceName, b.cfg.DeviceID, b.cfg.Version)
+		if err != nil {
+			b.sendError(s, i, err)
 			return
 		}
-		b.handleBroadcast(args[0], args[1:], msg.Chat.ID, msg.MessageID)
-		return
-	case "/start":
-		b.handleStart(msg.Chat.ID, msg.MessageID)
-		return
-	case "/help", "/h":
-		b.handleHelp(msg.Chat.ID, msg.MessageID)
-		return
-	}
-
-	// For all other commands, route to the currently selected device
-	state, err := b.getPinnedState()
-	if err != nil {
-		b.sendMessage(msg.Chat.ID, fmt.Sprintf("Failed to read selection state: %v", err), msg.MessageID)
-		return
-	}
-
-	target := state.SelectedDevice
-	if target == "" {
-		target = b.cfg.DeviceID
-	}
-
-	fileID := ""
-	fileName := ""
-	if msg.Document != nil {
-		fileID = msg.Document.FileID
-		fileName = msg.Document.FileName
-	}
-
-	if target == b.cfg.DeviceID {
-		runBg := func(f func()) {
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						errText := fmt.Sprintf("🔴 Execution Panicked: %v", r)
-						b.sendMessage(msg.Chat.ID, errText, msg.MessageID)
-					}
-				}()
-				f()
-			}()
+		embed := &discordgo.MessageEmbed{
+			Title:       "🖥️ WinMon Device Information",
+			Color:       0x00FF88,
+			Description: fmt.Sprintf("```\n%s\n```", info),
 		}
-
-		if cmd == "/upload" {
-			if msg.Document == nil {
-				b.sendMessage(msg.Chat.ID, "File upload must include an attached document.", msg.MessageID)
-				return
-			}
-			if len(args) < 1 {
-				b.sendMessage(msg.Chat.ID, "Usage: `/upload <destination>`", msg.MessageID)
-				return
-			}
-			dest := strings.Join(args, " ")
-			runBg(func() { b.handleDocumentUpload(msg.Document, msg.Chat.ID, msg.MessageID, dest) })
-		} else if cmd == "/updateservice" {
-			if msg.Document == nil {
-				b.sendMessage(msg.Chat.ID, "Update service must include an attached executable.", msg.MessageID)
-				return
-			}
-			runBg(func() { b.handleServiceUpdate(msg.Document, msg.Chat.ID, msg.MessageID) })
-		} else if cmd == "/playsound" {
-			if msg.Document == nil {
-				b.sendMessage(msg.Chat.ID, "Playsound must include an attached audio file.", msg.MessageID)
-				return
-			}
-			runBg(func() { b.handlePlaySound(msg.Document, msg.Chat.ID, msg.MessageID) })
-		} else if cmd == "/setwallpaper" {
-			if msg.Document == nil {
-				b.sendMessage(msg.Chat.ID, "Setwallpaper must include an attached image file.", msg.MessageID)
-				return
-			}
-			runBg(func() { b.handleSetWallpaper(msg.Document, msg.Chat.ID, msg.MessageID) })
-		} else {
-			runBg(func() { b.executeCommandLocally(cmd, args, msg.Chat.ID, msg.MessageID) })
-		}
-	} else {
-		// Route command to target worker using pinned message
-		state.PendingCommand = &CommandState{
-			Command:      cmd,
-			TargetDevice: target,
-			Args:         args,
-			Timestamp:    time.Now(),
-			FileID:       fileID,
-			FileName:     fileName,
-		}
-		b.updatePinnedState(state)
+		b.sendEmbedWithButtons(s, i, embed)
+	case "btn_clipboard":
+		b.executeCommandLocally("/clipboard", nil, s, i)
+	case "btn_mute":
+		b.executeCommandLocally("/mute", nil, s, i)
 	}
 }
 
-// Commands Implementation
-func (b *BotCoordinator) handleStart(chatID int64, msgID int64) {
-	pcName, _ := os.Hostname()
-	ip := device.GetIPAddresses()
-	osName, _ := device.GetOSVersion()
-	curTime := time.Now().Format("2006-01-02 15:04:05")
-
-	svcStatus := "Running (Console Mode)"
-	if service.IsRunningAsService() {
-		svcStatus = "Running (Windows Service)"
+func (b *BotCoordinator) sendHelpPanel(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	embed := &discordgo.MessageEmbed{
+		Title:       "⚡ WinMon Control Panel",
+		Description: fmt.Sprintf("**Connected Endpoint:** `%s` (UUID: `%s`)\n**Status:** 🟢 Online & Managed", b.cfg.DeviceName, b.cfg.DeviceID),
+		Color:       0x5865F2, // Discord Blurple
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "📸 Capture & Media",
+				Value:  "`/screenshot`, `/webcam`, `/screenrecord [dur]`, `/listen [dur]`, `/wallpaper`",
+				Inline: false,
+			},
+			{
+				Name:   "💻 System & Diagnostics",
+				Value:  "`/deviceinfo`, `/processes`, `/kill <target>`, `/cmd <command>`",
+				Inline: false,
+			},
+			{
+				Name:   "🔊 Audio & Display Controls",
+				Value:  "`/setvol <0-100>`, `/mute`, `/unmute`, `/tts <text>`, `/brightness <0-100>`",
+				Inline: false,
+			},
+			{
+				Name:   "⌨️ Remote Input & Control",
+				Value:  "`/type <text>`, `/keypress <key>`, `/hotkey <combo>`, `/mouse <action>`, `/clipboard`",
+				Inline: false,
+			},
+			{
+				Name:   "📁 Files & Utilities",
+				Value:  "`/download <filepath>`, `/upload <file> [dest]`, `/notify <msg>`",
+				Inline: false,
+			},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "WinMon Remote PC Management • Powered by Discord",
+		},
+		Timestamp: time.Now().Format(time.RFC3339),
 	}
 
-	text := fmt.Sprintf("💻 *WinMon Client Status*\n\n"+
-		"*PC Name:* %s\n"+
-		"*Local IP:* %s\n"+
-		"*OS:* %s\n"+
-		"*Time:* %s\n"+
-		"*Service Status:* %s\n\n"+
-		"Use `/help` or `/h` to list available commands.",
-		pcName, ip, osName, curTime, svcStatus)
-
-	b.sendMessage(chatID, text, msgID)
+	b.sendEmbedWithButtons(s, i, embed)
 }
 
-func (b *BotCoordinator) handleHelp(chatID int64, msgID int64) {
-	helpText := `📖 *WinMon Help Guide*
+func (b *BotCoordinator) sendEmbedWithButtons(s *discordgo.Session, i *discordgo.InteractionCreate, embed *discordgo.MessageEmbed) {
+	components := []discordgo.MessageComponent{
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{
+					Label:    "Screenshot",
+					Style:    discordgo.PrimaryButton,
+					CustomID: "btn_screenshot",
+					Emoji:    &discordgo.ComponentEmoji{Name: "📸"},
+				},
+				discordgo.Button{
+					Label:    "Processes",
+					Style:    discordgo.SecondaryButton,
+					CustomID: "btn_processes",
+					Emoji:    &discordgo.ComponentEmoji{Name: "📋"},
+				},
+				discordgo.Button{
+					Label:    "Device Info",
+					Style:    discordgo.SecondaryButton,
+					CustomID: "btn_deviceinfo",
+					Emoji:    &discordgo.ComponentEmoji{Name: "🖥️"},
+				},
+				discordgo.Button{
+					Label:    "Clipboard",
+					Style:    discordgo.SecondaryButton,
+					CustomID: "btn_clipboard",
+					Emoji:    &discordgo.ComponentEmoji{Name: "📋"},
+				},
+				discordgo.Button{
+					Label:    "Mute",
+					Style:    discordgo.DangerButton,
+					CustomID: "btn_mute",
+					Emoji:    &discordgo.ComponentEmoji{Name: "🔇"},
+				},
+			},
+		},
+	}
 
-⚙️ *Mesh Control*
-• /devices - List registered devices
-• /select <device> - Set active device
-• /deviceinfo - Show selected PC info
-• /broadcast <cmd> - Run command on all
-
-🖥️ *General & System*
-• /start - Diagnostic system overview
-• /status - Uptime, CPU, RAM, Disk, Battery
-• /version - System, Bot, and Go versions
-• /processes [filter] - List top running processes
-• /kill <process> - Kill running process
-• /cmd <cmd> - Execute shell command
-• /shutdown - Shutdown this PC
-• /restart - Restart this PC
-
-📂 *File Management*
-• /download <path> - Download file or ZIP folder
-• /upload <dest> - Upload attached Telegram file
-
-📸 *Media & Capture*
-• /screenshot - Grab screen capture
-• /webcam - Grab webcam capture
-• /screenrecord <duration> - Record GIF screen (e.g. 5s)
-• /listen <duration> - Record WAV audio (e.g. 10s)
-
-🔊 *Audio Controls*
-• /tts <text> - Speak message aloud
-• /playsound - Play attached WAV/MP3 sound
-• /setvol <0-100> - Set speaker volume
-• /maxvol | /minvol - Max/Min volume
-• /mute | /unmute - Mute/Unmute audio
-
-⌨️ *Input Automation*
-• /type <text> - Type string simulation
-• /keypress <key> - Press key (e.g. enter, space)
-• /hotkey <keys> - Trigger combo (e.g. ctrl+c, win+r)
-• /mouse move <x> <y> - Move cursor
-• /mouse click | rightclick | doubleclick - Mouse clicks
-• /mouse scroll <amount> - Scroll mouse wheel
-
-🖥️ *Display*
-• /brightness <0-100> - Adjust monitor brightness
-• /wallpaper - Fetch current desktop wallpaper
-• /setwallpaper - Set desktop wallpaper (attach image)
-
-🛠️ *Service Controls*
-• /shutdownservice - Shutdown WinMon service
-• /restartservice - Restart WinMon service
-• /updateservice - Update bot binary (attach exe)
-• /implode - Completely remove WinMon service and files`
-
-	b.sendMessage(chatID, helpText, msgID)
+	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Embeds:     []*discordgo.MessageEmbed{embed},
+		Components: components,
+	})
 }
 
-func (b *BotCoordinator) handleDevices(chatID int64, msgID int64) {
-	state, err := b.getPinnedState()
+func (b *BotCoordinator) sendText(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Content: content,
+	})
+}
+
+func (b *BotCoordinator) sendError(s *discordgo.Session, i *discordgo.InteractionCreate, err error) {
+	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Content: fmt.Sprintf("🔴 **Execution Error:** %v", err),
+	})
+}
+
+func (b *BotCoordinator) sendFile(s *discordgo.Session, i *discordgo.InteractionCreate, filePath string, caption string) {
+	file, err := os.Open(filePath)
 	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to load device mesh: %v", err), msgID)
+		b.sendError(s, i, err)
 		return
 	}
+	defer file.Close()
 
-	var sb strings.Builder
-	sb.WriteString("🖥️ *WinMon Mesh Devices*\n\n")
-
-	for id, dev := range state.Devices {
-		statusStr := "🟢"
-		// If last seen > 45s, mark offline
-		if time.Since(dev.LastSeen) > 45*time.Second {
-			statusStr = "🔴"
-		}
-
-		selectedIndicator := ""
-		if state.SelectedDevice == id {
-			selectedIndicator = " ⭐"
-		}
-
-		sb.WriteString(fmt.Sprintf("%s *%s*%s\nID: `%s` | Group: `%s` | V: `%s`\n\n",
-			statusStr, dev.DeviceName, selectedIndicator, id, dev.Group, dev.Version))
-	}
-
-	b.sendMessage(chatID, sb.String(), msgID)
+	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Content: caption,
+		Files: []*discordgo.File{
+			{
+				Name:        filepath.Base(filePath),
+				ContentType: "application/octet-stream",
+				Reader:      file,
+			},
+		},
+	})
 }
 
-func (b *BotCoordinator) handleSelect(deviceID string, chatID int64, msgID int64) {
-	state, err := b.getPinnedState()
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Error reading mesh: %v", err), msgID)
-		return
-	}
-
-	// Verify device exists
-	_, exists := state.Devices[deviceID]
-	if !exists {
-		b.sendMessage(chatID, fmt.Sprintf("Device ID `%s` not found in mesh.", deviceID), msgID)
-		return
-	}
-
-	state.SelectedDevice = deviceID
-
-	// If the selected device is active online, we can make it the active poller
-	dev, ok := state.Devices[deviceID]
-	if ok && time.Since(dev.LastSeen) <= 45*time.Second {
-		state.ActivePoller = deviceID
-	}
-
-	err = b.updatePinnedState(state)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to update selection: %v", err), msgID)
-		return
-	}
-
-	b.sendMessage(chatID, fmt.Sprintf("⭐ Selected Device: *%s* (`%s`)", dev.DeviceName, deviceID), msgID)
-}
-
-func (b *BotCoordinator) handleBroadcast(command string, args []string, chatID int64, msgID int64) {
-	state, err := b.getPinnedState()
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Error writing broadcast state: %v", err), msgID)
-		return
-	}
-
-	state.BroadcastCommand = &CommandState{
-		Command:   command,
-		Args:      args,
-		Timestamp: time.Now(),
-	}
-
-	b.updatePinnedState(state)
-	b.sendMessage(chatID, fmt.Sprintf("📢 Broadcasted command `/ %s` to all online mesh clients.", command), msgID)
-}
-
-func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, chatID int64, msgID int64) {
+func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, s *discordgo.Session, i *discordgo.InteractionCreate) {
 	start := time.Now()
 
-	// Continuous typing indicator loop
-	action := "typing"
-	switch cmd {
-	case "/download", "/screenrecord", "/listen":
-		action = "upload_document"
-	case "/screenshot", "/webcam":
-		action = "upload_photo"
-	}
-	cancelTyping := b.startTypingIndicator(chatID, action)
-	defer cancelTyping()
-
-	// Early validation to avoid spawning unnecessary helper processes
-	if cmd == "/brightness" {
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/brightness <0-100>`", msgID)
-			return
-		}
-		_, err := strconv.Atoi(args[0])
-		if err != nil {
-			b.sendMessage(chatID, "Brightness must be an integer.", msgID)
-			return
-		}
-	}
-
-	// Check if this command is interactive (must run in user session helper if running as service)
+	// Check interactive status
 	isInteractive := false
 	interactiveCmds := map[string]bool{
 		"/screenshot":   true,
@@ -1103,7 +728,6 @@ func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, chatID
 	}
 
 	if isInteractive && service.IsRunningAsService() {
-		// Dispatch command over IPC to Persistent Session Agent
 		flatArgs := strings.Join(args, " ")
 		resp, err := service.SendIPCCommand(service.IPCRequest{
 			Cmd:      cmd,
@@ -1112,630 +736,256 @@ func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, chatID
 		}, 60*time.Second)
 
 		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("🔴 Session Agent IPC Error: %v", err), msgID)
+			b.sendError(s, i, fmt.Errorf("Session Agent IPC Error: %w", err))
 			return
 		}
 		if !resp.Success {
-			b.sendMessage(chatID, fmt.Sprintf("🔴 Command Execution Error: %s", resp.Error), msgID)
+			b.sendError(s, i, errors.New(resp.Error))
 			return
 		}
 
-		// Read output if any (session agent writes output to temp files)
-		b.handleHelperOutput(cmd, chatID, msgID, start)
+		b.handleHelperOutputDiscord(cmd, s, i, start)
 		return
 	}
 
-	// Execute natively (either console mode, or command is non-interactive)
-	b.executeNative(cmd, args, chatID, msgID, start)
+	// Native execution
+	b.executeNativeDiscord(cmd, args, s, i, start)
 }
 
-func (b *BotCoordinator) executeNative(cmd string, args []string, chatID int64, msgID int64, start time.Time) {
+func (b *BotCoordinator) executeNativeDiscord(cmd string, args []string, s *discordgo.Session, i *discordgo.InteractionCreate, start time.Time) {
 	switch cmd {
 	case "/deviceinfo":
 		info, err := device.GetDeviceInfo(b.cfg.DeviceName, b.cfg.DeviceID, b.cfg.Version)
 		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Error: %v", err), msgID)
+			b.sendError(s, i, err)
 			return
 		}
-		text := fmt.Sprintf("ℹ️ *Device Information*\n\n"+
-			"*Device Name:* %s\n"+
-			"*Device ID:* %s\n"+
-			"*PC Name:* %s\n"+
-			"*IP Address:* %s\n"+
-			"*Version:* %s\n"+
-			"*OS:* %s\n"+
-			"*Uptime:* %s\n",
-			info.DeviceName, info.DeviceID, info.PCName, info.IPAddress, info.Version, info.OS, device.FormatDuration(info.Uptime))
-		b.sendMessage(chatID, text, msgID)
-
-	case "/status":
-		status, err := device.GetStatus()
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Error: %v", err), msgID)
-			return
+		embed := &discordgo.MessageEmbed{
+			Title:       "🖥️ WinMon Device Info",
+			Color:       0x00FF88,
+			Description: fmt.Sprintf("```\n%s\n```", info),
 		}
-		svcStatus := "Console"
-		if service.IsRunningAsService() {
-			svcStatus = "Service"
-		}
-		text := fmt.Sprintf("📊 *System Status* (%s)\n\n"+
-			"*CPU Usage:* %.1f%%\n"+
-			"*RAM Usage:* %.1f%% (%.1f GB / %.1f GB)\n"+
-			"*Disk Usage:* %.1f%% (%.1f GB Free / %.1f GB Total)\n"+
-			"*Battery:* %d%% (%s)\n"+
-			"*Uptime:* %s\n",
-			svcStatus, status.CPUPercent, status.RAMPercent, status.RAMTotalGB-status.RAMFreeGB, status.RAMTotalGB,
-			status.DiskPercent, status.DiskFreeGB, status.DiskTotalGB, status.BatteryCharge, status.BatteryStatus,
-			device.FormatDuration(status.Uptime))
-		b.sendMessage(chatID, text, msgID)
-
-	case "/version":
-		pcVer, _ := device.GetOSVersion()
-		text := fmt.Sprintf("🤖 *Version Diagnostics*\n\n"+
-			"*TaskBot Version:* %s\n"+
-			"*Go Version:* %s\n"+
-			"*Windows Version:* %s\n",
-			b.cfg.Version, "go1.20", pcVer)
-		b.sendMessage(chatID, text, msgID)
-
+		b.sendEmbedWithButtons(s, i, embed)
 	case "/processes":
-		filter := ""
-		if len(args) > 0 {
-			filter = args[0]
+		procs, err := shell.ExecuteCommand("tasklist", 10*time.Second)
+		if err != nil {
+			b.sendError(s, i, err)
+			return
 		}
-		b.handleProcesses(filter, chatID, msgID)
-
+		if len(procs) > 1950 {
+			procs = procs[:1950] + "\n... [truncated]"
+		}
+		b.sendText(s, i, fmt.Sprintf("📋 **Running Processes:**\n```\n%s\n```", procs))
 	case "/kill":
 		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/kill <process_name_or_pid>`", msgID)
+			b.sendText(s, i, "Usage: `/kill <PID or ProcessName>`")
 			return
 		}
-		b.handleKill(args[0], chatID, msgID)
-
+		killCmd := fmt.Sprintf("taskkill /F /PID %s || taskkill /F /IM %s", args[0], args[0])
+		out, err := shell.ExecuteCommand(killCmd, 10*time.Second)
+		if err != nil {
+			b.sendError(s, i, fmt.Errorf("%s (%v)", out, err))
+		} else {
+			b.sendText(s, i, fmt.Sprintf("🟢 Process `%s` terminated successfully:\n```\n%s\n```", args[0], out))
+		}
 	case "/cmd":
 		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/cmd <command>`", msgID)
+			b.sendText(s, i, "Usage: `/cmd <command>`")
 			return
 		}
-		cmdLine := strings.Join(args, " ")
-		b.sendChatAction(chatID, "typing")
-		out, err := shell.ExecuteCommand(cmdLine, time.Duration(b.cfg.CommandTimeoutSeconds)*time.Second)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("🔴 Execution Error: %v\n\n```\n%s\n```", err, out), msgID)
-		} else {
-			b.sendMessage(chatID, fmt.Sprintf("🟢 Execution Success:\n\n```\n%s\n```", out), msgID)
+		out, err := shell.ExecuteCommand(args[0], 20*time.Second)
+		if len(out) > 1900 {
+			out = out[:1900] + "\n... [truncated]"
 		}
-
+		if err != nil {
+			b.sendText(s, i, fmt.Sprintf("🔴 **Command Execution Failed:**\n```\n%s\nError: %v\n```", out, err))
+		} else {
+			b.sendText(s, i, fmt.Sprintf("🟢 **Command Output:**\n```\n%s\n```", out))
+		}
 	case "/download":
 		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/download <path>`", msgID)
+			b.sendText(s, i, "Usage: `/download <filepath>`")
 			return
 		}
-		b.handleDownload(strings.Join(args, " "), chatID, msgID)
-
-	case "/upload":
-		b.sendMessage(chatID, "File upload must include an attached document.", msgID)
-
-	// Audio commands (non-interactive side of mute/vol)
+		path := args[0]
+		b.sendFile(s, i, path, fmt.Sprintf("📥 File download from `%s`:", b.cfg.DeviceName))
 	case "/setvol":
 		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/setvol <0-100>`", msgID)
+			b.sendText(s, i, "Usage: `/setvol <0-100>`")
 			return
 		}
 		vol, err := strconv.Atoi(args[0])
 		if err != nil {
-			b.sendMessage(chatID, "Volume must be an integer.", msgID)
+			b.sendText(s, i, "Volume must be an integer (0-100).")
 			return
 		}
-		audio.SetVolume(vol)
-		b.sendMessage(chatID, fmt.Sprintf("🔊 Volume set to %d%%", vol), msgID)
-
-	case "/maxvol":
-		audio.SetVolume(100)
-		b.sendMessage(chatID, "🔊 Volume set to 100%", msgID)
-
-	case "/minvol":
-		audio.SetVolume(0)
-		b.sendMessage(chatID, "🔇 Volume set to 0%", msgID)
-
+		err = audio.SetVolume(vol)
+		if err != nil {
+			b.sendError(s, i, err)
+		} else {
+			b.sendText(s, i, fmt.Sprintf("🔊 Volume set to **%d%%**.", vol))
+		}
 	case "/mute":
-		audio.SetMute(true)
-		b.sendMessage(chatID, "🔇 System audio muted.", msgID)
-
+		err := audio.SetMute(true)
+		if err != nil {
+			b.sendError(s, i, err)
+		} else {
+			b.sendText(s, i, "🔇 Audio muted.")
+		}
 	case "/unmute":
-		audio.SetMute(false)
-		b.sendMessage(chatID, "🔊 System audio unmuted.", msgID)
-
-	case "/brightness":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/brightness <0-100>`", msgID)
-			return
-		}
-		bri, err := strconv.Atoi(args[0])
+		err := audio.SetMute(false)
 		if err != nil {
-			b.sendMessage(chatID, "Brightness must be an integer.", msgID)
-			return
+			b.sendError(s, i, err)
+		} else {
+			b.sendText(s, i, "🔊 Audio unmuted.")
 		}
-		display.SetBrightness(bri)
-		b.sendMessage(chatID, fmt.Sprintf("🔆 Brightness adjusted to %d%%", bri), msgID)
-
-	case "/alert":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/alert <message>`", msgID)
-			return
-		}
-		msg := strings.Join(args, " ")
-		go func() {
-			notifications.ShowAlert("WinMon Notice", msg)
-		}()
-		b.sendMessage(chatID, "🔔 Alert dispatched to target desktop.", msgID)
-
-	case "/shutdownservice":
-		b.sendMessage(chatID, "🛑 Shutting down WinMon service on this PC...", msgID)
-		time.Sleep(1 * time.Second)
-		close(b.stopChan)
-
-	case "/shutdown":
-		b.sendMessage(chatID, "🔌 Shutting down the PC...", msgID)
-		time.Sleep(1 * time.Second)
-		err := exec.Command("shutdown", "/s", "/t", "0").Run()
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("🔴 Shutdown failed: %v", err), msgID)
-		}
-
-	case "/restart":
-		b.sendMessage(chatID, "🔄 Restarting the PC...", msgID)
-		time.Sleep(1 * time.Second)
-		err := exec.Command("shutdown", "/r", "/t", "0").Run()
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("🔴 Restart failed: %v", err), msgID)
-		}
-
-	case "/implode":
-		if len(args) == 0 || strings.ToLower(args[0]) != "confirm" {
-			b.sendMessage(chatID, "⚠️ *WARNING*: This command will completely uninstall the WinMon service and delete all local config, state, and executable files from this PC.\n\nThis action is *IRREVERSIBLE*.\n\nTo proceed, please type:\n`/implode confirm`", msgID)
-			return
-		}
-		b.sendMessage(chatID, "💥 Initiating self-destruction. WinMon service and local files will be completely removed...", msgID)
-		err := updater.ImplodeService(b.cfg.BotToken, chatID)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("🔴 Implode failed: %v", err), msgID)
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
-		close(b.stopChan)
-
-	case "/restartservice":
-		b.sendMessage(chatID, "🔄 Restarting WinMon service...", msgID)
-		go func() {
-			time.Sleep(1 * time.Second)
-			exec.Command("powershell", "-Command", "Restart-Service -Name WinMon -Force").Run()
-		}()
-
-	// Fallback/interactive commands executed in console mode directly
-	case "/screenshot":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "screenshot.jpg")
-		err := media.CaptureScreen(tempPath)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to capture screenshot: %v", err), msgID)
-			return
-		}
-		defer os.Remove(tempPath)
-		b.sendChatAction(chatID, "upload_photo")
-		b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
-
-	case "/webcam":
-		tempPath := filepath.Join(service.GetSharedTempDir(), "webcam.jpg")
-		err := media.CaptureWebcam(tempPath)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to capture webcam: %v", err), msgID)
-			return
-		}
-		defer os.Remove(tempPath)
-		b.sendChatAction(chatID, "upload_photo")
-		b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
-
-	case "/screenrecord":
-		dur := parseDuration(strings.Join(args, " "))
-		tempPath := filepath.Join(service.GetSharedTempDir(), "record.gif")
-		b.sendMessage(chatID, fmt.Sprintf("📹 Recording screen for %s...", dur), msgID)
-		err := media.RecordScreen(dur, tempPath)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Recording failed: %v", err), msgID)
-			return
-		}
-		defer os.Remove(tempPath)
-		b.sendFile(chatID, "sendDocument", "document", tempPath, msgID)
-
-	case "/listen":
-		dur := parseDuration(strings.Join(args, " "))
-		tempPath := filepath.Join(service.GetSharedTempDir(), "audio.wav")
-		b.sendMessage(chatID, fmt.Sprintf("🎙️ Recording audio for %s...", dur), msgID)
-		err := media.RecordAudio(dur, tempPath)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Audio recording failed: %v", err), msgID)
-			return
-		}
-		defer os.Remove(tempPath)
-		b.sendFile(chatID, "sendDocument", "document", tempPath, msgID)
-
-	case "/tts":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/tts <text>`", msgID)
-			return
-		}
-		audio.SpeakTTS(strings.Join(args, " "))
-		b.sendMessage(chatID, "🗣️ Speaking message through target default audio device.", msgID)
-
-	case "/playsound":
-		b.sendMessage(chatID, "Playsound must be initiated by attaching a sound file.", msgID)
-
-	case "/wallpaper":
-		path, err := display.GetWallpaperPath()
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to get wallpaper: %v", err), msgID)
-			return
-		}
-		if _, err := os.Stat(path); err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Current wallpaper path: `%s` (file not found or inaccessible)", path), msgID)
-			return
-		}
-		b.sendChatAction(chatID, "upload_photo")
-		b.sendFile(chatID, "sendPhoto", "photo", path, msgID)
-
-	case "/clipboard":
-		txt, err := clipboard.GetClipboardLocal()
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to read clipboard: %v", err), msgID)
-			return
-		}
-		b.sendMessage(chatID, fmt.Sprintf("📋 Clipboard Content:\n```\n%s\n```", txt), msgID)
-
-	case "/setclipboard":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/setclipboard <text>`", msgID)
-			return
-		}
-		clipboard.SetClipboardLocal(strings.Join(args, " "))
-		b.sendMessage(chatID, "📋 Clipboard set.", msgID)
-
-	case "/setwallpaper":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/setwallpaper <path>` (or attach an image to command)", msgID)
-			return
-		}
-		path := strings.Join(args, " ")
-		err := display.SetWallpaperLocal(path)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to set wallpaper: %v", err), msgID)
-			return
-		}
-		b.sendMessage(chatID, "🖼️ Wallpaper set successfully.", msgID)
-
-	case "/notify":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/notify <message>` or `/notify <title>|<message>`", msgID)
-			return
-		}
-		fullArgs := strings.Join(args, " ")
-		parts := strings.Split(fullArgs, "|")
-		title := "WinMon Notification"
-		msg := fullArgs
-		if len(parts) > 1 {
-			title = parts[0]
-			msg = parts[1]
-		}
-		err := notifications.ShowToastLocal(title, msg)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to show notification: %v", err), msgID)
-			return
-		}
-		b.sendMessage(chatID, "🔔 Notification shown.", msgID)
-
-	case "/type":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/type <text>`", msgID)
-			return
-		}
-		inputText := strings.Join(args, " ")
-		inputText = strings.ReplaceAll(inputText, "\\\"", "\"")
-		input.TypeText(inputText)
-		b.sendMessage(chatID, "⌨️ Text typed.", msgID)
-
-	case "/keypress":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/keypress <key>`", msgID)
-			return
-		}
-		key := strings.Join(args, " ")
-		err := input.PressKey(key)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to press key: %v", err), msgID)
-			return
-		}
-		b.sendMessage(chatID, "⌨️ Key pressed.", msgID)
-
-	case "/hotkey":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/hotkey <keys>` (e.g. ctrl+alt+delete)", msgID)
-			return
-		}
-		hotkey := strings.Join(args, " ")
-		err := input.TriggerHotkey(hotkey)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to trigger hotkey: %v", err), msgID)
-			return
-		}
-		b.sendMessage(chatID, "⌨️ Hotkey triggered.", msgID)
-
-	case "/mouse":
-		if len(args) < 1 {
-			b.sendMessage(chatID, "Usage: `/mouse <action>` (e.g. click, move 100 200)", msgID)
-			return
-		}
-		fullArgs := strings.Join(args, " ")
-		fields := strings.Fields(fullArgs)
-		if len(fields) < 1 {
-			b.sendMessage(chatID, "Invalid mouse action.", msgID)
-			return
-		}
-		action := fields[0]
-		var err error
-		switch action {
-		case "move":
-			if len(fields) < 3 {
-				b.sendMessage(chatID, "Usage: `/mouse move <x> <y>`", msgID)
-				return
-			}
-			x, _ := strconv.Atoi(fields[1])
-			y, _ := strconv.Atoi(fields[2])
-			err = input.MoveMouse(x, y)
-		case "click":
-			input.ClickMouse()
-		case "rightclick":
-			input.RightClickMouse()
-		case "doubleclick":
-			input.DoubleClickMouse()
-		case "scroll":
-			if len(fields) < 2 {
-				b.sendMessage(chatID, "Usage: `/mouse scroll <amount>`", msgID)
-				return
-			}
-			amount, _ := strconv.Atoi(fields[1])
-			input.ScrollMouse(amount)
-		default:
-			b.sendMessage(chatID, fmt.Sprintf("Unknown mouse action: %s", action), msgID)
-			return
-		}
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Mouse action failed: %v", err), msgID)
-			return
-		}
-		b.sendMessage(chatID, "🖱️ Mouse action executed.", msgID)
-
 	default:
-		b.sendMessage(chatID, "❓ Unknown command. Use `/help` to see list of options.", msgID)
-		return
-	}
-
-	b.sendExecutionTime(chatID, msgID, start)
-}
-
-func (b *BotCoordinator) handleProcesses(filter string, chatID int64, msgID int64) {
-	psCmd := "Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 ProcessName, Id, CPU | ConvertTo-Json"
-	if filter != "" {
-		psCmd = fmt.Sprintf("Get-Process -Name *%s* | Sort-Object CPU -Descending | Select-Object -First 15 ProcessName, Id, CPU | ConvertTo-Json", filter)
-	}
-
-	c := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd)
-	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	out, err := c.Output()
-	if err != nil {
-		b.sendMessage(chatID, "No matching processes found or failed to query.", msgID)
-		return
-	}
-
-	var sb strings.Builder
-	sb.WriteString("📁 *Process Registry*\n\n```\n%-20s %-8s %-6s\n" + strings.Repeat("-", 36) + "\n")
-
-	// Parse JSON
-	type ProcessInfo struct {
-		ProcessName string  `json:"ProcessName"`
-		ID          int     `json:"Id"`
-		CPU         float64 `json:"CPU"`
-	}
-
-	// Try single object first
-	var single ProcessInfo
-	if err := json.Unmarshal(out, &single); err == nil {
-		sb.WriteString(fmt.Sprintf("%-20s %-8d %-6.1f\n", single.ProcessName, single.ID, single.CPU))
-	} else {
-		var list []ProcessInfo
-		if err := json.Unmarshal(out, &list); err == nil {
-			for _, p := range list {
-				sb.WriteString(fmt.Sprintf("%-20s %-8d %-6.1f\n", p.ProcessName, p.ID, p.CPU))
-			}
-		}
-	}
-	sb.WriteString("```")
-	b.sendMessage(chatID, fmt.Sprintf(sb.String(), "Process Name", "PID", "CPU"), msgID)
-}
-
-func (b *BotCoordinator) handleKill(target string, chatID int64, msgID int64) {
-	var cmd *exec.Cmd
-	if pid, err := strconv.Atoi(target); err == nil {
-		cmd = exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid))
-	} else {
-		// Append extension if missing
-		if !strings.HasSuffix(strings.ToLower(target), ".exe") {
-			target += ".exe"
-		}
-		cmd = exec.Command("taskkill", "/F", "/IM", target)
-	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("🔴 Failed to terminate process `%s`.\n\nError: %v\n```\n%s\n```", target, err, strings.TrimSpace(string(out))), msgID)
-	} else {
-		b.sendMessage(chatID, fmt.Sprintf("🟢 Successfully terminated process `%s`.", target), msgID)
-	}
-}
-
-func (b *BotCoordinator) handleDownload(path string, chatID int64, msgID int64) {
-	info, err := os.Stat(path)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("File path not found: %v", err), msgID)
-		return
-	}
-
-	b.sendChatAction(chatID, "upload_document")
-
-	if info.IsDir() {
-		// Zip it
-		b.sendMessage(chatID, "🗜️ Target is a folder. Compressing to temporary ZIP...", msgID)
-		zipPath := filepath.Join(service.GetSharedTempDir(), info.Name()+".zip")
-		err := files.ZipDirectory(path, zipPath)
+		// Fallback for native execution of interactive commands when running in console mode
+		err := RunSessionHelper(cmd, strings.Join(args, " "))
 		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Compression failed: %v", err), msgID)
+			b.sendError(s, i, err)
 			return
 		}
-		defer os.Remove(zipPath)
-
-		_, err = b.sendFile(chatID, "sendDocument", "document", zipPath, msgID)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to send ZIP file: %v", err), msgID)
-		}
-	} else {
-		_, err = b.sendFile(chatID, "sendDocument", "document", path, msgID)
-		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("Failed to send file: %v", err), msgID)
-		}
+		b.handleHelperOutputDiscord(cmd, s, i, start)
 	}
 }
 
-func (b *BotCoordinator) handleHelperOutput(cmd string, chatID int64, msgID int64, start time.Time) {
-	// Locate temporary helper outputs based on command type
+func (b *BotCoordinator) handleHelperOutputDiscord(cmd string, s *discordgo.Session, i *discordgo.InteractionCreate, start time.Time) {
+	dur := fmt.Sprintf("(%d ms)", time.Since(start).Milliseconds())
+
 	switch cmd {
 	case "/screenshot":
 		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
 		if _, err := os.Stat(tempPath); err == nil {
-			b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
+			b.sendFile(s, i, tempPath, "📸 **Desktop Screenshot** "+dur)
 			os.Remove(tempPath)
 		} else {
-			b.sendMessage(chatID, "Failed to retrieve screenshot from session helper.", msgID)
+			b.sendText(s, i, "Failed to retrieve screenshot from session agent.")
 		}
 	case "/webcam":
 		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
 		if _, err := os.Stat(tempPath); err == nil {
-			b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
+			b.sendFile(s, i, tempPath, "📷 **Webcam Photo** "+dur)
 			os.Remove(tempPath)
 		} else {
-			b.sendMessage(chatID, "Failed to retrieve webcam capture from session helper.", msgID)
+			b.sendText(s, i, "Failed to retrieve webcam capture from session agent.")
 		}
 	case "/screenrecord":
 		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
 		if _, err := os.Stat(tempPath); err == nil {
-			b.sendFile(chatID, "sendDocument", "document", tempPath, msgID)
+			b.sendFile(s, i, tempPath, "🎥 **Screen Recording GIF** "+dur)
 			os.Remove(tempPath)
 		} else {
-			b.sendMessage(chatID, "Failed to retrieve recording from session helper.", msgID)
+			b.sendText(s, i, "Failed to retrieve screen recording from session agent.")
 		}
 	case "/listen":
 		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
 		if _, err := os.Stat(tempPath); err == nil {
-			b.sendFile(chatID, "sendDocument", "document", tempPath, msgID)
+			b.sendFile(s, i, tempPath, "🎙️ **Microphone Audio Recording** "+dur)
 			os.Remove(tempPath)
 		} else {
-			b.sendMessage(chatID, "Failed to retrieve audio from session helper.", msgID)
+			b.sendText(s, i, "Failed to retrieve audio recording from session agent.")
 		}
 	case "/clipboard":
 		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
 		if data, err := os.ReadFile(tempPath); err == nil {
-			b.sendMessage(chatID, fmt.Sprintf("📋 Clipboard Content:\n```\n%s\n```", string(data)), msgID)
+			b.sendText(s, i, fmt.Sprintf("📋 **Clipboard Content:**\n```\n%s\n```", string(data)))
 			os.Remove(tempPath)
 		} else {
-			b.sendMessage(chatID, "Failed to read clipboard from session helper.", msgID)
+			b.sendText(s, i, "Failed to read clipboard from session agent.")
 		}
 	case "/wallpaper":
 		tempPath := filepath.Join(service.GetSharedTempDir(), "helper_wallpaper.jpg")
 		if _, err := os.Stat(tempPath); err == nil {
-			b.sendFile(chatID, "sendPhoto", "photo", tempPath, msgID)
+			b.sendFile(s, i, tempPath, "🖼️ **Desktop Wallpaper** "+dur)
 			os.Remove(tempPath)
 		} else {
-			// Read path directly if it is a system default
-			path, err := display.GetWallpaperPath()
-			if err == nil && path != "" {
-				b.sendMessage(chatID, fmt.Sprintf("Wallpaper is a desktop background solid color or defaults to path: `%s`", path), msgID)
-			} else {
-				b.sendMessage(chatID, "Failed to capture wallpaper from session helper.", msgID)
-			}
+			b.sendText(s, i, "Failed to capture wallpaper from session agent.")
 		}
 	case "/brightness":
-		b.sendMessage(chatID, "🔆 Brightness adjusted successfully in user session.", msgID)
+		b.sendText(s, i, "🔆 Display brightness adjusted successfully.")
 	default:
-		// Commands like type, setvol, mute, toast etc don't return files, they just succeed.
-		b.sendMessage(chatID, "🟢 Command completed successfully in user session.", msgID)
+		b.sendText(s, i, fmt.Sprintf("🟢 Command `%s` executed successfully %s.", cmd, dur))
 	}
-
-	b.sendExecutionTime(chatID, msgID, start)
 }
 
-func (b *BotCoordinator) sendExecutionTime(chatID int64, msgID int64, start time.Time) {
-	duration := time.Since(start)
-	durationMs := duration.Milliseconds()
-	completionText := fmt.Sprintf("\n\nCompleted successfully.\n\nExecution Time:\n%d ms", durationMs)
+func (b *BotCoordinator) handleAttachmentUploadInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, att *discordgo.MessageAttachment, destination string) {
+	b.downloadAndSaveAttachment(s, i, att.URL, att.Filename, destination)
+}
 
-	b.lastMsgsMu.Lock()
-	state := b.lastMsgs[msgID]
-	delete(b.lastMsgs, msgID)
-	b.lastMsgsMu.Unlock()
-
-	lastID := int64(0)
-	lastText := ""
-	lastIsMedia := false
-	if state != nil {
-		lastID = state.ID
-		lastText = state.Text
-		lastIsMedia = state.IsMedia
+func (b *BotCoordinator) handleAttachmentUpload(s *discordgo.Session, channelID string, att *discordgo.MessageAttachment, destination string) {
+	// Direct message fallback
+	finalPath, err := files.PrepareUploadPath(destination, att.Filename)
+	if err != nil {
+		s.ChannelMessageSend(channelID, fmt.Sprintf("🔴 Invalid destination path: %v", err))
+		return
 	}
 
-	if lastID != 0 {
-		if lastIsMedia {
-			type EditMsgCaptionReq struct {
-				ChatID    int64  `json:"chat_id"`
-				MessageID int64  `json:"message_id"`
-				Caption   string `json:"caption"`
-				ParseMode string `json:"parse_mode"`
-			}
-			_, err := b.request("editMessageCaption", EditMsgCaptionReq{
-				ChatID:    chatID,
-				MessageID: lastID,
-				Caption:   strings.TrimSpace(completionText),
-				ParseMode: "Markdown",
-			})
-			if err == nil {
-				return
-			}
-		} else {
-			type EditMsgReq struct {
-				ChatID    int64  `json:"chat_id"`
-				MessageID int64  `json:"message_id"`
-				Text      string `json:"text"`
-				ParseMode string `json:"parse_mode"`
-			}
-			_, err := b.request("editMessageText", EditMsgReq{
-				ChatID:    chatID,
-				MessageID: lastID,
-				Text:      lastText + completionText,
-				ParseMode: "Markdown",
-			})
-			if err == nil {
-				return
-			}
-		}
+	resp, err := http.Get(att.URL)
+	if err != nil {
+		s.ChannelMessageSend(channelID, fmt.Sprintf("🔴 Failed to download attachment: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	out, err := os.Create(finalPath)
+	if err != nil {
+		s.ChannelMessageSend(channelID, fmt.Sprintf("🔴 Failed to create file: %v", err))
+		return
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		s.ChannelMessageSend(channelID, fmt.Sprintf("🔴 Failed to save file: %v", err))
+		return
 	}
 
-	b.sendMessage(chatID, fmt.Sprintf("Completed successfully.\n\nExecution Time:\n%d ms", durationMs), msgID)
+	s.ChannelMessageSend(channelID, fmt.Sprintf("🟢 File uploaded successfully to `%s`", finalPath))
+}
+
+func (b *BotCoordinator) downloadAndSaveAttachment(s *discordgo.Session, i *discordgo.InteractionCreate, url string, filename string, destination string) {
+	finalPath, err := files.PrepareUploadPath(destination, filename)
+	if err != nil {
+		b.sendError(s, i, err)
+		return
+	}
+
+	resp, err := http.Get(url)
+	if err != nil {
+		b.sendError(s, i, fmt.Errorf("failed to download attachment: %w", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	out, err := os.Create(finalPath)
+	if err != nil {
+		b.sendError(s, i, fmt.Errorf("failed to create local file: %w", err))
+		return
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		b.sendError(s, i, fmt.Errorf("failed to write local file: %w", err))
+		return
+	}
+
+	b.sendText(s, i, fmt.Sprintf("🟢 File uploaded successfully to `%s`", finalPath))
+}
+
+func (b *BotCoordinator) handlePlaySoundAttachment(s *discordgo.Session, i *discordgo.InteractionCreate, att *discordgo.MessageAttachment) {
+	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_play_"+att.Filename)
+	b.downloadAndSaveAttachment(s, i, att.URL, att.Filename, tempPath)
+	b.executeCommandLocally("/playsound", []string{tempPath}, s, i)
+	os.Remove(tempPath)
+}
+
+func (b *BotCoordinator) handleSetWallpaperAttachment(s *discordgo.Session, i *discordgo.InteractionCreate, att *discordgo.MessageAttachment) {
+	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_wall_"+att.Filename)
+	b.downloadAndSaveAttachment(s, i, att.URL, att.Filename, tempPath)
+	b.executeCommandLocally("/setwallpaper", []string{tempPath}, s, i)
+	os.Remove(tempPath)
 }
 
 // Session helper commands (executed inside user desktop session)
@@ -1767,7 +1017,6 @@ func RunSessionHelper(cmd string, args string) error {
 		if err != nil {
 			return err
 		}
-		// Copy file to tempPath
 		in, err := os.Open(path)
 		if err != nil {
 			return err
@@ -1790,9 +1039,7 @@ func RunSessionHelper(cmd string, args string) error {
 		}
 		return notifications.ShowToastLocal(title, msg)
 	case "/type":
-		inputText := args
-		// Handle escaped quotes
-		inputText = strings.ReplaceAll(inputText, "\\\"", "\"")
+		inputText := strings.ReplaceAll(args, "\\\"", "\"")
 		input.TypeText(inputText)
 		return nil
 	case "/keypress":
@@ -1847,329 +1094,12 @@ func RunSessionHelper(cmd string, args string) error {
 	return fmt.Errorf("unsupported helper command: %s", cmd)
 }
 
-func (b *BotCoordinator) handleDocumentUpload(doc *TelegramDocument, chatID int64, msgID int64, destination string) {
-	// Downloads attached document from Telegram and saves it to target destination path
-	// File paths must be validated and directories automatically created.
-	// Returns confirmation saved path
-	type GetFileReq struct {
-		FileID string `json:"file_id"`
-	}
-	respBytes, err := b.request("getFile", GetFileReq{FileID: doc.FileID})
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to query upload file: %v", err), msgID)
-		return
-	}
-
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			FilePath string `json:"file_path"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to parse file info: %v", err), msgID)
-		return
-	}
-
-	// Download URL: https://api.telegram.org/file/bot<token>/<file_path>
-	downloadURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", b.cfg.BotToken, wrapper.Result.FilePath)
-	resp, err := b.client.Get(downloadURL)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Download failed: %v", err), msgID)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Prepare final save path
-	finalPath, err := files.PrepareUploadPath(destination, doc.FileName)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Invalid destination structure: %v", err), msgID)
-		return
-	}
-
-	out, err := os.Create(finalPath)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to create file locally: %v", err), msgID)
-		return
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to write file locally: %v", err), msgID)
-		return
-	}
-
-	b.sendMessage(chatID, fmt.Sprintf("🟢 Document successfully saved locally:\n`%s`", finalPath), msgID)
-}
-
-func (b *BotCoordinator) handleServiceUpdate(doc *TelegramDocument, chatID int64, msgID int64) {
-	b.sendMessage(chatID, "📥 Downloading new update binary...", msgID)
-
-	type GetFileReq struct {
-		FileID string `json:"file_id"`
-	}
-	respBytes, err := b.request("getFile", GetFileReq{FileID: doc.FileID})
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to query update binary: %v", err), msgID)
-		return
-	}
-
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			FilePath string `json:"file_path"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to parse file info: %v", err), msgID)
-		return
-	}
-
-	downloadURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", b.cfg.BotToken, wrapper.Result.FilePath)
-	resp, err := b.client.Get(downloadURL)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Download failed: %v", err), msgID)
-		return
-	}
-	defer resp.Body.Close()
-
-	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_new.exe")
-	out, err := os.Create(tempPath)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to create temporary update file: %v", err), msgID)
-		return
-	}
-
-	_, err = io.Copy(out, resp.Body)
-	out.Close() // Close immediately to release file lock on Windows
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to write update binary: %v", err), msgID)
-		os.Remove(tempPath)
-		return
-	}
-
-	// Validate executable
-	err = updater.ValidateBinary(tempPath)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("🔴 Validation Failed: %v", err), msgID)
-		os.Remove(tempPath)
-		return
-	}
-
-	b.sendMessage(chatID, "🔄 Validation successful. Restarting WinMon service to apply update...", msgID)
-
-	// Launch update script
-	err = updater.UpdateService(tempPath, b.cfg.BotToken, chatID)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("🔴 Update launch failed: %v", err), msgID)
-		os.Remove(tempPath)
-		return
-	}
-
-	// Exit service process so that the script can copy the file
-	time.Sleep(500 * time.Millisecond)
-	close(b.stopChan)
-}
-
-func parseDuration(s string) time.Duration {
-	s = strings.TrimSpace(strings.ToLower(s))
-	if s == "" {
+func parseDuration(arg string) time.Duration {
+	d, err := strconv.Atoi(strings.TrimSpace(arg))
+	if err != nil || d <= 0 {
 		return 5 * time.Second
 	}
-	// If it's a number only, default to seconds
-	if val, err := strconv.Atoi(s); err == nil {
-		return time.Duration(val) * time.Second
-	}
-	// Check for seconds
-	if strings.HasSuffix(s, "seconds") || strings.HasSuffix(s, "second") || strings.HasSuffix(s, "s") {
-		numStr := s
-		numStr = strings.TrimSuffix(numStr, "seconds")
-		numStr = strings.TrimSuffix(numStr, "second")
-		numStr = strings.TrimSuffix(numStr, "s")
-		numStr = strings.TrimSpace(numStr)
-		if val, err := strconv.Atoi(numStr); err == nil {
-			return time.Duration(val) * time.Second
-		}
-	}
-	// Check for minutes
-	if strings.HasSuffix(s, "minutes") || strings.HasSuffix(s, "minute") || strings.HasSuffix(s, "m") {
-		numStr := s
-		numStr = strings.TrimSuffix(numStr, "minutes")
-		numStr = strings.TrimSuffix(numStr, "minute")
-		numStr = strings.TrimSuffix(numStr, "m")
-		numStr = strings.TrimSpace(numStr)
-		if val, err := strconv.Atoi(numStr); err == nil {
-			return time.Duration(val) * time.Minute
-		}
-	}
-	// Fallback to time.ParseDuration
-	if d, err := time.ParseDuration(s); err == nil {
-		return d
-	}
-	return 5 * time.Second
-}
-
-func (b *BotCoordinator) startTypingIndicator(chatID int64, action string) context.CancelFunc {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		b.sendChatAction(chatID, action)
-		ticker := time.NewTicker(4 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				b.sendChatAction(chatID, action)
-			}
-		}
-	}()
-	return cancel
-}
-
-func (b *BotCoordinator) handlePlaySound(doc *TelegramDocument, chatID int64, msgID int64) {
-	start := time.Now()
-	b.sendMessage(chatID, "📥 Downloading audio file...", msgID)
-
-	type GetFileReq struct {
-		FileID string `json:"file_id"`
-	}
-	respBytes, err := b.request("getFile", GetFileReq{FileID: doc.FileID})
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to query audio file: %v", err), msgID)
-		return
-	}
-
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			FilePath string `json:"file_path"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to parse file info: %v", err), msgID)
-		return
-	}
-
-	downloadURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", b.cfg.BotToken, wrapper.Result.FilePath)
-	resp, err := b.client.Get(downloadURL)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Download failed: %v", err), msgID)
-		return
-	}
-	defer resp.Body.Close()
-
-	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_sound"+filepath.Ext(doc.FileName))
-	out, err := os.Create(tempPath)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to create temporary audio file: %v", err), msgID)
-		return
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to write audio file: %v", err), msgID)
-		return
-	}
-
-	b.sendMessage(chatID, "🎵 Playing sound on target PC...", msgID)
-
-	if service.IsRunningAsService() {
-		ipcResp, ipcErr := service.SendIPCCommand(service.IPCRequest{
-			Cmd:      "/playsound",
-			FlatArgs: tempPath,
-		}, 60*time.Second)
-		if ipcErr != nil {
-			err = ipcErr
-		} else if !ipcResp.Success {
-			err = errors.New(ipcResp.Error)
-		}
-	} else {
-		err = audio.PlaySoundLocal(tempPath)
-	}
-
-	os.Remove(tempPath)
-
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("🔴 Failed to play audio: %v", err), msgID)
-	} else {
-		b.sendMessage(chatID, "🟢 Audio played successfully.", msgID)
-	}
-	b.sendExecutionTime(chatID, msgID, start)
-}
-
-func (b *BotCoordinator) handleSetWallpaper(doc *TelegramDocument, chatID int64, msgID int64) {
-	start := time.Now()
-	b.sendMessage(chatID, "📥 Downloading wallpaper image...", msgID)
-
-	type GetFileReq struct {
-		FileID string `json:"file_id"`
-	}
-	respBytes, err := b.request("getFile", GetFileReq{FileID: doc.FileID})
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to query image file: %v", err), msgID)
-		return
-	}
-
-	var wrapper struct {
-		Ok     bool `json:"ok"`
-		Result struct {
-			FilePath string `json:"file_path"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(respBytes, &wrapper); err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to parse file info: %v", err), msgID)
-		return
-	}
-
-	downloadURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", b.cfg.BotToken, wrapper.Result.FilePath)
-	resp, err := b.client.Get(downloadURL)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Download failed: %v", err), msgID)
-		return
-	}
-	defer resp.Body.Close()
-
-	tempPath := filepath.Join(service.GetSharedTempDir(), "winmon_wallpaper"+filepath.Ext(doc.FileName))
-	out, err := os.Create(tempPath)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to create temporary image file: %v", err), msgID)
-		return
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("Failed to write image file: %v", err), msgID)
-		return
-	}
-
-	b.sendMessage(chatID, "🖼️ Setting desktop wallpaper on target PC...", msgID)
-
-	if service.IsRunningAsService() {
-		ipcResp, ipcErr := service.SendIPCCommand(service.IPCRequest{
-			Cmd:      "/setwallpaper",
-			FlatArgs: tempPath,
-		}, 60*time.Second)
-		if ipcErr != nil {
-			err = ipcErr
-		} else if !ipcResp.Success {
-			err = errors.New(ipcResp.Error)
-		}
-	} else {
-		err = display.SetWallpaperLocal(tempPath)
-	}
-
-	os.Remove(tempPath)
-
-	if err != nil {
-		b.sendMessage(chatID, fmt.Sprintf("🔴 Failed to set wallpaper: %v", err), msgID)
-	} else {
-		b.sendMessage(chatID, "🟢 Wallpaper updated successfully.", msgID)
-	}
-	b.sendExecutionTime(chatID, msgID, start)
+	return time.Duration(d) * time.Second
 }
 
 // RunSessionAgentLoop runs the persistent IPC listener in Session 1

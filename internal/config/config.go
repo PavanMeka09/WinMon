@@ -12,14 +12,15 @@ import (
 var configFS embed.FS
 
 type Config struct {
-	BotToken              string  `json:"bot_token"`
-	AllowedUsers          []int64 `json:"allowed_users"`
-	DeviceID              string  `json:"device_id"`
-	DeviceName            string  `json:"device_name"`
-	Group                 string  `json:"group"`
-	Version               string  `json:"version"`
-	MaxUploadSizeMB       int64   `json:"max_upload_size_mb"`
-	CommandTimeoutSeconds int     `json:"command_timeout_seconds"`
+	BotToken              string   `json:"bot_token"`
+	GuildID               string   `json:"guild_id,omitempty"`
+	AllowedUsers          []string `json:"allowed_users"`
+	DeviceID              string   `json:"device_id"`
+	DeviceName            string   `json:"device_name"`
+	Group                 string   `json:"group"`
+	Version               string   `json:"version"`
+	MaxUploadSizeMB       int64    `json:"max_upload_size_mb"`
+	CommandTimeoutSeconds int      `json:"command_timeout_seconds"`
 }
 
 func LoadConfig() (*Config, error) {
@@ -30,7 +31,7 @@ func LoadConfig() (*Config, error) {
 	if bytes, err := configFS.ReadFile("config.json"); err == nil {
 		var tempCfg Config
 		if err := json.Unmarshal(bytes, &tempCfg); err == nil {
-			if tempCfg.BotToken != "" && tempCfg.BotToken != "YOUR_TELEGRAM_BOT_TOKEN" {
+			if tempCfg.BotToken != "" && tempCfg.BotToken != "YOUR_DISCORD_BOT_TOKEN" && tempCfg.BotToken != "YOUR_TELEGRAM_BOT_TOKEN" {
 				data = bytes
 				loadedFromEmbedded = true
 			}
@@ -53,7 +54,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	// If the loaded configuration from template has no token, it means we have no valid config at all.
-	if cfg.BotToken == "" || cfg.BotToken == "YOUR_TELEGRAM_BOT_TOKEN" {
+	if cfg.BotToken == "" || cfg.BotToken == "YOUR_DISCORD_BOT_TOKEN" || cfg.BotToken == "YOUR_TELEGRAM_BOT_TOKEN" {
 		return nil, errors.New("no valid configuration found embedded")
 	}
 
