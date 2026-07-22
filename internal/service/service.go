@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -15,45 +14,6 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
-
-var (
-	advapi32                 = syscall.NewLazyDLL("advapi32.dll")
-	procDuplicateTokenEx     = advapi32.NewProc("DuplicateTokenEx")
-	procCreateProcessAsUserW = advapi32.NewProc("CreateProcessAsUserW")
-
-	wtsapi32                         = syscall.NewLazyDLL("wtsapi32.dll")
-	procWTSQueryUserToken            = wtsapi32.NewProc("WTSQueryUserToken")
-	kernel32                         = syscall.NewLazyDLL("kernel32.dll")
-	procWTSGetActiveConsoleSessionId = kernel32.NewProc("WTSGetActiveConsoleSessionId")
-)
-
-type STARTUPINFO struct {
-	Cb            uint32
-	Reserved      *uint16
-	Desktop       *uint16
-	Title         *uint16
-	X             uint32
-	Y             uint32
-	XSize         uint32
-	YSize         uint32
-	XCountChars   uint32
-	YCountChars   uint32
-	FillAttribute uint32
-	Flags         uint32
-	ShowCmd       uint16
-	Reserved2     uint16
-	Reserved2Ptr  *byte
-	StdInput      syscall.Handle
-	StdOutput     syscall.Handle
-	StdError      syscall.Handle
-}
-
-type PROCESS_INFORMATION struct {
-	Process   syscall.Handle
-	Thread    syscall.Handle
-	ProcessId uint32
-	ThreadId  uint32
-}
 
 // SafeClose closes a channel if it isn't already closed.
 func SafeClose(ch chan struct{}) {
@@ -126,89 +86,210 @@ func RunInUserSession(args string, timeout time.Duration) error {
 	}
 	logDebug("RunInUserSession started. exePath: %s, args: %s", exePath, args)
 
-	sessionID, _, _ := procWTSGetActiveConsoleSessionId.Call()
+	sessionID := windows.WTSGetActiveConsoleSessionId()
 	logDebug("Active console session ID: %d", sessionID)
 	if sessionID == 0xFFFFFFFF {
 		logDebug("No active console session found")
 		return fmt.Errorf("no active console session found")
 	}
 
-	var userToken syscall.Handle
-	ret, _, err := procWTSQueryUserToken.Call(sessionID, uintptr(unsafe.Pointer(&userToken)))
-	if ret == 0 {
+	var userToken windows.Token
+	err = windows.WTSQueryUserToken(sessionID, &userToken)
+	if err != nil {
 		logDebug("WTSQueryUserToken failed: %v", err)
 		return fmt.Errorf("no user logged in on active console session (WTSQueryUserToken failed: %v)", err)
 	}
-	defer syscall.CloseHandle(userToken)
+	defer userToken.Close()
 
-	var dupToken syscall.Handle
-	ret, _, err = procDuplicateTokenEx.Call(
-		uintptr(userToken),
-		0xF01FF, // TOKEN_ALL_ACCESS
-		0,
-		1, // SecurityIdentification
-		1, // TokenPrimary
-		uintptr(unsafe.Pointer(&dupToken)),
+	var dupToken windows.Token
+	err = windows.DuplicateTokenEx(
+		userToken,
+		windows.TOKEN_ALL_ACCESS,
+		nil,
+		windows.SecurityIdentification,
+		windows.TokenPrimary,
+		&dupToken,
 	)
-	if ret == 0 {
-		logDebug("procDuplicateTokenEx failed: %v", err)
+	if err != nil {
+		logDebug("DuplicateTokenEx failed: %v", err)
 		return fmt.Errorf("failed to duplicate user token: %v", err)
 	}
-	defer syscall.CloseHandle(dupToken)
+	defer dupToken.Close()
 
-	var si STARTUPINFO
+	var si windows.StartupInfo
 	si.Cb = uint32(unsafe.Sizeof(si))
 	desktopStr := "winsta0\\default"
-	desktopUTF16, _ := syscall.UTF16PtrFromString(desktopStr)
+	desktopUTF16, _ := windows.UTF16PtrFromString(desktopStr)
 	si.Desktop = desktopUTF16
 
-	var pi PROCESS_INFORMATION
+	var pi windows.ProcessInformation
 
 	cmdLine := fmt.Sprintf("\"%s\" %s", exePath, args)
-	cmdLineUTF16, err := syscall.UTF16PtrFromString(cmdLine)
+	cmdLineUTF16, err := windows.UTF16PtrFromString(cmdLine)
 	if err != nil {
 		logDebug("UTF16PtrFromString failed: %v", err)
 		return err
 	}
 
 	logDebug("Spawning process: %s", cmdLine)
-	ret, _, err = procCreateProcessAsUserW.Call(
-		uintptr(dupToken),
-		0,
-		uintptr(unsafe.Pointer(cmdLineUTF16)),
-		0,
-		0,
-		0,
-		0x08000000, // CREATE_NO_WINDOW
-		0,
-		0,
-		uintptr(unsafe.Pointer(&si)),
-		uintptr(unsafe.Pointer(&pi)),
+	err = windows.CreateProcessAsUser(
+		dupToken,
+		nil,
+		cmdLineUTF16,
+		nil,
+		nil,
+		false,
+		windows.CREATE_NO_WINDOW,
+		nil,
+		nil,
+		&si,
+		&pi,
 	)
-	if ret == 0 {
-		logDebug("CreateProcessAsUserW failed: %v", err)
-		return fmt.Errorf("CreateProcessAsUserW failed: %v", err)
+	if err != nil {
+		logDebug("CreateProcessAsUser failed: %v", err)
+		return fmt.Errorf("CreateProcessAsUser failed: %v", err)
 	}
-	defer syscall.CloseHandle(pi.Process)
-	defer syscall.CloseHandle(pi.Thread)
+	defer windows.CloseHandle(pi.Process)
+	defer windows.CloseHandle(pi.Thread)
 	logDebug("Process spawned successfully. PID: %d, ThreadID: %d", pi.ProcessId, pi.ThreadId)
 
-	event, err := syscall.WaitForSingleObject(pi.Process, uint32(timeout.Milliseconds()))
+	event, err := windows.WaitForSingleObject(pi.Process, uint32(timeout.Milliseconds()))
 	if err != nil {
 		logDebug("WaitForSingleObject failed: %v", err)
 		return fmt.Errorf("failed waiting for helper process: %v", err)
 	}
-	if event == syscall.WAIT_TIMEOUT {
-		syscall.TerminateProcess(pi.Process, 1)
+	if event == uint32(windows.WAIT_TIMEOUT) {
+		windows.TerminateProcess(pi.Process, 1)
 		logDebug("Helper process timed out")
 		return fmt.Errorf("helper process timed out after %s", timeout)
 	}
 
 	var exitCode uint32
-	syscall.GetExitCodeProcess(pi.Process, &exitCode)
+	err = windows.GetExitCodeProcess(pi.Process, &exitCode)
+	if err != nil {
+		logDebug("GetExitCodeProcess failed: %v", err)
+		return fmt.Errorf("failed to get helper process exit code: %v", err)
+	}
 	logDebug("Helper process exited. ExitCode: %d", exitCode)
 	if exitCode != 0 {
 		return fmt.Errorf("helper process exited with non-zero code %d", exitCode)
+	}
+
+	return nil
+}
+
+// IsPipeListening checks if a named pipe is available for connection.
+func IsPipeListening(pipeName string) bool {
+	pipePathUTF16, err := windows.UTF16PtrFromString(pipeName)
+	if err != nil {
+		return false
+	}
+	hPipe, err := windows.CreateFile(
+		pipePathUTF16,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		0,
+		nil,
+		windows.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err == nil {
+		windows.CloseHandle(hPipe)
+		return true
+	}
+	if err == windows.ERROR_PIPE_BUSY {
+		return true
+	}
+	return false
+}
+
+// EnsureUserAgentRunning checks if the IPC pipe for the user agent is responsive, spawning winmon.exe -session-agent if needed.
+func EnsureUserAgentRunning() error {
+	if IsPipeListening(PipeName) {
+		return nil
+	}
+
+	// Pipe not responding or unavailable; spawn persistent user agent in user session
+	logDebug("User agent IPC pipe unavailable. Spawning persistent session agent...")
+	return SpawnUserAgentInUserSession()
+}
+
+// SpawnUserAgentInUserSession spawns WinMon.exe as a persistent background daemon (-session-agent) inside the active user console session.
+func SpawnUserAgentInUserSession() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		logDebug("os.Executable failed: %v", err)
+		return err
+	}
+
+	sessionID := windows.WTSGetActiveConsoleSessionId()
+	if sessionID == 0xFFFFFFFF {
+		return fmt.Errorf("no active console session found")
+	}
+
+	var userToken windows.Token
+	err = windows.WTSQueryUserToken(sessionID, &userToken)
+	if err != nil {
+		return fmt.Errorf("no user logged in on active console session (WTSQueryUserToken failed: %v)", err)
+	}
+	defer userToken.Close()
+
+	var dupToken windows.Token
+	err = windows.DuplicateTokenEx(
+		userToken,
+		windows.TOKEN_ALL_ACCESS,
+		nil,
+		windows.SecurityIdentification,
+		windows.TokenPrimary,
+		&dupToken,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to duplicate user token: %v", err)
+	}
+	defer dupToken.Close()
+
+	var si windows.StartupInfo
+	si.Cb = uint32(unsafe.Sizeof(si))
+	desktopStr := "winsta0\\default"
+	desktopUTF16, _ := windows.UTF16PtrFromString(desktopStr)
+	si.Desktop = desktopUTF16
+
+	var pi windows.ProcessInformation
+
+	cmdLine := fmt.Sprintf("\"%s\" -session-agent", exePath)
+	cmdLineUTF16, err := windows.UTF16PtrFromString(cmdLine)
+	if err != nil {
+		return err
+	}
+
+	logDebug("Spawning persistent session agent process: %s", cmdLine)
+	err = windows.CreateProcessAsUser(
+		dupToken,
+		nil,
+		cmdLineUTF16,
+		nil,
+		nil,
+		false,
+		windows.CREATE_NO_WINDOW,
+		nil,
+		nil,
+		&si,
+		&pi,
+	)
+	if err != nil {
+		logDebug("CreateProcessAsUser failed: %v", err)
+		return fmt.Errorf("CreateProcessAsUser failed: %v", err)
+	}
+	windows.CloseHandle(pi.Process)
+	windows.CloseHandle(pi.Thread)
+	logDebug("Persistent Session Agent spawned successfully. PID: %d", pi.ProcessId)
+
+	// Wait up to 3 seconds for named pipe to be ready
+	for i := 0; i < 30; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if IsPipeListening(PipeName) {
+			return nil
+		}
 	}
 
 	return nil

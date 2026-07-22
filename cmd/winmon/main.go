@@ -25,12 +25,22 @@ func main() {
 
 	serviceAction := flag.String("service", "", "Service action: install, uninstall, start, stop")
 	sessionHelper := flag.Bool("session-helper", false, "Run as user session helper")
+	sessionAgent := flag.Bool("session-agent", false, "Run as persistent user session agent")
 	helperCmd := flag.String("cmd", "", "Command to execute (for session helper)")
 	helperArgs := flag.String("args", "", "Arguments for the command (for session helper)")
 	consoleMode := flag.Bool("console", false, "Force running WinMon in console mode (skip service checks/installation)")
 	flag.Parse()
 
-	// 1. Session Helper Routing
+	// 1. Persistent Session Agent Routing
+	if *sessionAgent {
+		err := bot.RunSessionAgentLoop()
+		if err != nil {
+			log.Fatalf("Session agent error: %v", err)
+		}
+		os.Exit(0)
+	}
+
+	// 2. Session Helper Routing (Backward Compatibility)
 	if *sessionHelper {
 		if *helperCmd == "" {
 			log.Fatal("Missing -cmd argument for session helper")

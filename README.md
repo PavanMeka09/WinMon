@@ -36,16 +36,24 @@ WinMon is a secure Windows PC Remote Management tool that runs as a Telegram Bot
    *(Note: `device_id` and `device_name` are dynamically determined using the computer's hostname and hardware UUID, meaning the same executable can be shared across multiple computers without conflicts).*
 
 3. **Build the Binary:**
-   To build the standalone executable with your configuration embedded:
+
+   #### Windows Version Metadata & Manifest (Anti-virus Evasion)
+   Before building, ensure the Windows resource files (metadata and manifest) are generated. This prevents false positive detections by antiviruses. If you modify any metadata in `./winres/winres.json`, regenerate the resource files:
    ```cmd
-   go build -ldflags "-H windowsgui" -o winmon.exe cmd\winmon\main.go
+   go run github.com/tc-hib/go-winres@latest make --in winres/winres.json --out cmd/winmon/rsrc
    ```
 
+   To build the standalone executable with your configuration embedded:
+   ```cmd
+   go build -ldflags="-s -w" -o winmon.exe ./cmd/winmon
+   ```
+   *(Optional: If you want to hide the console window when starting directly, add `-H=windowsgui` to the `-ldflags` string: `-ldflags="-s -w -H=windowsgui"`).*
+
    #### Obfuscated Build (Highly Recommended for Security)
-   To prevent anyone from extracting your Telegram Bot Token from the compiled executable, use [garble](https://github.com/burrowers/garble) to obfuscate and scramble package names, function names, and string literals:
+   To prevent extraction of your Telegram Bot Token from the compiled executable, use [garble](https://github.com/burrowers/garble) to obfuscate package names, function names, and string literals:
    ```cmd
    go install mvdan.cc/garble@latest
-   garble -literals build -ldflags "-H windowsgui" -o winmon.exe cmd\winmon\main.go
+   garble -literals build -ldflags="-s -w -H=windowsgui" -o winmon.exe ./cmd/winmon
    ```
 
 ## Running WinMon

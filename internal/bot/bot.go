@@ -1103,18 +1103,24 @@ func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, chatID
 	}
 
 	if isInteractive && service.IsRunningAsService() {
-		// Launch helper inside user session
-		// Flatten args
+		// Dispatch command over IPC to Persistent Session Agent
 		flatArgs := strings.Join(args, " ")
-		helperArgs := fmt.Sprintf("-session-helper -cmd %s -args \"%s\"", cmd, strings.ReplaceAll(flatArgs, "\"", "\\\""))
+		resp, err := service.SendIPCCommand(service.IPCRequest{
+			Cmd:      cmd,
+			Args:     args,
+			FlatArgs: flatArgs,
+		}, 60*time.Second)
 
-		err := service.RunInUserSession(helperArgs, 60*time.Second)
 		if err != nil {
-			b.sendMessage(chatID, fmt.Sprintf("🔴 Session Helper Error: %v", err), msgID)
+			b.sendMessage(chatID, fmt.Sprintf("🔴 Session Agent IPC Error: %v", err), msgID)
+			return
+		}
+		if !resp.Success {
+			b.sendMessage(chatID, fmt.Sprintf("🔴 Command Execution Error: %s", resp.Error), msgID)
 			return
 		}
 
-		// Read output if any (session helper writes output to temp files)
+		// Read output if any (session agent writes output to temp files)
 		b.handleHelperOutput(cmd, chatID, msgID, start)
 		return
 	}
@@ -2071,8 +2077,15 @@ func (b *BotCoordinator) handlePlaySound(doc *TelegramDocument, chatID int64, ms
 	b.sendMessage(chatID, "🎵 Playing sound on target PC...", msgID)
 
 	if service.IsRunningAsService() {
-		helperArgs := fmt.Sprintf("-session-helper -cmd /playsound -args \"%s\"", strings.ReplaceAll(tempPath, "\"", "\\\""))
-		err = service.RunInUserSession(helperArgs, 60*time.Second)
+		ipcResp, ipcErr := service.SendIPCCommand(service.IPCRequest{
+			Cmd:      "/playsound",
+			FlatArgs: tempPath,
+		}, 60*time.Second)
+		if ipcErr != nil {
+			err = ipcErr
+		} else if !ipcResp.Success {
+			err = errors.New(ipcResp.Error)
+		}
 	} else {
 		err = audio.PlaySoundLocal(tempPath)
 	}
@@ -2136,8 +2149,15 @@ func (b *BotCoordinator) handleSetWallpaper(doc *TelegramDocument, chatID int64,
 	b.sendMessage(chatID, "🖼️ Setting desktop wallpaper on target PC...", msgID)
 
 	if service.IsRunningAsService() {
-		helperArgs := fmt.Sprintf("-session-helper -cmd /setwallpaper -args \"%s\"", strings.ReplaceAll(tempPath, "\"", "\\\""))
-		err = service.RunInUserSession(helperArgs, 60*time.Second)
+		ipcResp, ipcErr := service.SendIPCCommand(service.IPCRequest{
+			Cmd:      "/setwallpaper",
+			FlatArgs: tempPath,
+		}, 60*time.Second)
+		if ipcErr != nil {
+			err = ipcErr
+		} else if !ipcResp.Success {
+			err = errors.New(ipcResp.Error)
+		}
 	} else {
 		err = display.SetWallpaperLocal(tempPath)
 	}
@@ -2150,4 +2170,21 @@ func (b *BotCoordinator) handleSetWallpaper(doc *TelegramDocument, chatID int64,
 		b.sendMessage(chatID, "🟢 Wallpaper updated successfully.", msgID)
 	}
 	b.sendExecutionTime(chatID, msgID, start)
+}
+
+// RunSessionAgentLoop runs the persistent IPC listener in Session 1
+func RunSessionAgentLoop() error {
+	log.Println("Starting WinMon Persistent Session Agent (Session 1 IPC Listener)...")
+	return service.StartIPCAgentServer(func(req service.IPCRequest) service.IPCResponse {
+		err := RunSessionHelper(req.Cmd, req.FlatArgs)
+		if err != nil {
+			return service.IPCResponse{
+				Success: false,
+				Error:   err.Error(),
+			}
+		}
+		return service.IPCResponse{
+			Success: true,
+		}
+	})
 }
