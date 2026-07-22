@@ -348,20 +348,35 @@ func InstallService(name, displayName, desc string) error {
 		exePath = targetExePath
 	}
 
-	s, err := m.CreateService(name, exePath, mgr.Config{
+	quotedExePath := fmt.Sprintf("\"%s\"", exePath)
+	s, err := m.CreateService(name, quotedExePath, mgr.Config{
 		DisplayName: displayName,
 		Description: desc,
 		StartType:   mgr.StartAutomatic,
 	})
 	if err != nil {
-		return err
+		// If service already exists, open it and update BinaryPathName
+		var openErr error
+		s, openErr = m.OpenService(name)
+		if openErr != nil {
+			return fmt.Errorf("failed to create or open service %s: %w", name, err)
+		}
+		c, cfgErr := s.Config()
+		if cfgErr == nil {
+			c.BinaryPathName = quotedExePath
+			c.DisplayName = displayName
+			c.Description = desc
+			c.StartType = mgr.StartAutomatic
+			_ = s.UpdateConfig(c)
+		}
 	}
 	defer s.Close()
 
-	// Update description (mgr doesn't write description directly during CreateService config sometimes)
+	// Explicitly set ImagePath and Description in registry to guarantee proper quoting
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `System\CurrentControlSet\Services\`+name, registry.WRITE)
 	if err == nil {
-		k.SetStringValue("Description", desc)
+		_ = k.SetStringValue("ImagePath", quotedExePath)
+		_ = k.SetStringValue("Description", desc)
 		k.Close()
 	}
 
