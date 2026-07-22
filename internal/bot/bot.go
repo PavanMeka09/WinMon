@@ -365,6 +365,26 @@ func (b *BotCoordinator) registerSlashCommands() {
 			Name:        "unmute",
 			Description: "Unmute system audio",
 		},
+		{
+			Name:        "shutdown",
+			Description: "Initiate system shutdown",
+		},
+		{
+			Name:        "restart",
+			Description: "Initiate system restart",
+		},
+		{
+			Name:        "shutdownservice",
+			Description: "Stop WinMon service",
+		},
+		{
+			Name:        "restartservice",
+			Description: "Restart WinMon service",
+		},
+		{
+			Name:        "implode",
+			Description: "Uninstall WinMon service and terminate",
+		},
 	}
 
 	appID := b.session.State.User.ID
@@ -553,6 +573,16 @@ func (b *BotCoordinator) dispatchSlashCommand(s *discordgo.Session, i *discordgo
 	case "mute":
 		b.executeCommandLocally(cmd, nil, s, i)
 	case "unmute":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "shutdown":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "restart":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "shutdownservice":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "restartservice":
+		b.executeCommandLocally(cmd, nil, s, i)
+	case "implode":
 		b.executeCommandLocally(cmd, nil, s, i)
 	}
 }
@@ -839,6 +869,36 @@ func (b *BotCoordinator) executeNativeDiscord(cmd string, args []string, s *disc
 		} else {
 			b.sendText(s, i, "🔊 Audio unmuted.")
 		}
+	case "/shutdown":
+		b.sendText(s, i, "⚠️ Initiating target PC shutdown in 5 seconds...")
+		_, _ = shell.ExecuteCommand("shutdown /s /t 5 /c \"WinMon Remote Shutdown\"", 5*time.Second)
+	case "/restart":
+		b.sendText(s, i, "⚠️ Initiating target PC restart in 5 seconds...")
+		_, _ = shell.ExecuteCommand("shutdown /r /t 5 /c \"WinMon Remote Restart\"", 5*time.Second)
+	case "/shutdownservice":
+		b.sendText(s, i, "🛑 Stopping WinMon service/process...")
+		if service.IsRunningAsService() {
+			_ = service.StopService("WinMon")
+		} else {
+			go func() {
+				time.Sleep(1 * time.Second)
+				os.Exit(0)
+			}()
+		}
+	case "/restartservice":
+		b.sendText(s, i, "🔄 Restarting WinMon service...")
+		if service.IsRunningAsService() {
+			_ = service.StartService("WinMon")
+		}
+	case "/implode":
+		b.sendText(s, i, "💥 Uninstalling WinMon service and self-destructing...")
+		if service.IsRunningAsService() {
+			_ = service.UninstallService("WinMon")
+		}
+		go func() {
+			time.Sleep(2 * time.Second)
+			os.Exit(0)
+		}()
 	default:
 		// Fallback for native execution of interactive commands when running in console mode
 		err := RunSessionHelper(cmd, strings.Join(args, " "))
