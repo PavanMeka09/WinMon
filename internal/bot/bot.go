@@ -691,21 +691,29 @@ func (b *BotCoordinator) sendEmbedWithButtons(s *discordgo.Session, i *discordgo
 		},
 	}
 
-	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Embeds:     []*discordgo.MessageEmbed{embed},
-		Components: components,
+	embeds := []*discordgo.MessageEmbed{embed}
+	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds:     &embeds,
+		Components: &components,
 	})
+	if err != nil {
+		log.Printf("InteractionResponseEdit embed error: %v", err)
+	}
 }
 
 func (b *BotCoordinator) sendText(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
-	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Content: content,
+	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &content,
 	})
+	if err != nil {
+		log.Printf("InteractionResponseEdit text error: %v", err)
+	}
 }
 
 func (b *BotCoordinator) sendError(s *discordgo.Session, i *discordgo.InteractionCreate, err error) {
-	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Content: fmt.Sprintf("🔴 **Execution Error:** %v", err),
+	errMsg := fmt.Sprintf("🔴 **Execution Error:** %v", err)
+	_, _ = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &errMsg,
 	})
 }
 
@@ -717,16 +725,21 @@ func (b *BotCoordinator) sendFile(s *discordgo.Session, i *discordgo.Interaction
 	}
 	defer file.Close()
 
-	s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-		Content: caption,
-		Files: []*discordgo.File{
-			{
-				Name:        filepath.Base(filePath),
-				ContentType: "application/octet-stream",
-				Reader:      file,
-			},
+	files := []*discordgo.File{
+		{
+			Name:        filepath.Base(filePath),
+			ContentType: "application/octet-stream",
+			Reader:      file,
 		},
+	}
+
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &caption,
+		Files:   files,
 	})
+	if err != nil {
+		log.Printf("InteractionResponseEdit file error: %v", err)
+	}
 }
 
 func (b *BotCoordinator) executeCommandLocally(cmd string, args []string, s *discordgo.Session, i *discordgo.InteractionCreate) {
