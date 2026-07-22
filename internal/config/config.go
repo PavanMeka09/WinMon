@@ -13,7 +13,6 @@ var configFS embed.FS
 
 type Config struct {
 	BotToken              string   `json:"bot_token"`
-	GuildID               string   `json:"guild_id,omitempty"`
 	AllowedUsers          []string `json:"allowed_users"`
 	DeviceID              string   `json:"device_id"`
 	DeviceName            string   `json:"device_name"`

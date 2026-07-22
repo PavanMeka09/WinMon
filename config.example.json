@@ -1,8 +1,7 @@
 {
-  "bot_token": "YOUR_DISCORD_BOT_TOKEN",
-  "guild_id": "",
+  "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
   "allowed_users": [
-    "YOUR_DISCORD_USER_ID"
+    "YOUR_TELEGRAM_USER_ID_OR_USERNAME"
   ],
   "group": "home",
   "version": "1.0.0",

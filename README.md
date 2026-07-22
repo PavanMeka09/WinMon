@@ -1,34 +1,28 @@
 # WinMon
 
-WinMon is a secure Windows PC Remote Management tool that runs as a **Discord Bot**. It can be run either as a standard console application or installed as a persistent Windows Service (running in Session 0 with a persistent Named Pipe IPC User Agent in Session 1).
+WinMon is a secure Windows PC Remote Management tool that runs as a **Telegram Bot**. It can be run either as a standard console application or installed as a persistent Windows Service (running in Session 0 with a persistent Named Pipe IPC User Agent in Session 1).
 
 ---
 
 ## ⚡ Features
 
-- **Discord Native Slash Commands:** Auto-completing `/screenshot`, `/webcam`, `/screenrecord`, `/listen`, `/cmd`, `/processes`, `/kill`, `/download`, `/upload`, `/tts`, `/playsound`, `/setwallpaper`, `/notify`, `/mouse`, `/type`, `/hotkey`, `/keypress`, `/clipboard`, `/brightness`, `/setvol`, `/mute`, `/unmute`.
-- **Interactive Control Buttons:** Instant response buttons for Screenshot, Processes, Device Info, Clipboard, and Audio Mute.
+- **Interactive Inline Keyboard Dashboard:** Touch-friendly buttons for instant Screenshot, Webcam, Voice Note recording, System Metrics, Processes, Clipboard, PC Lock, and Volume controls.
+- **Telegram Auto-Completing Commands:** Typing `/` automatically lists commands like `/screenshot`, `/webcam`, `/screenrecord`, `/listen`, `/cmd`, `/sysinfo`, `/processes`, `/kill`, `/download`, `/upload`, `/clipboard`, `/brightness`, `/volume`, `/lock`, `/notify`, `/setwallpaper`.
+- **Native Voice Notes:** High-quality microphone audio capture delivered directly as Telegram Voice Messages (`.ogg`/`.wav`).
 - **Persistent User Agent & Named Pipe IPC:** Seamless Session 0 (Service) <-> Session 1 (User Session) IPC communication via Windows Named Pipes (`\\.\pipe\WinMonIPC`) with sub-10ms response times.
-- **Zero Hosting Required:** Operates 100% on Discord's free cloud infrastructure.
-- **Security:** Restricts bot control to designated Discord User Snowflake IDs.
+- **Zero Hosting Required:** Operates 100% on Telegram's free cloud infrastructure.
+- **Security:** Restricts bot control to designated Telegram User IDs or Usernames.
 
 ---
 
 ## 📋 Prerequisites
 
 1. **Go** (`1.26.5` or later recommended)
-2. **Discord Bot Token**:
-   - Go to [Discord Developer Portal](https://discord.com/developers/applications) -> Create an Application -> **Bot**.
-   - Enable **Message Content Intent** under Bot settings.
-   - Copy the **Bot Token**.
-3. **Bot Invite Link**:
-   - Go to **OAuth2** -> **URL Generator**.
-   - Select scopes: `bot` and `applications.commands`.
-   - Grant permissions (Send Messages, Attach Files, Embed Links, Read Message History).
-   - Use the generated URL to invite the bot to your private Discord Server.
-4. **Your Discord User ID**:
-   - Enable Developer Mode in Discord Settings (`Advanced -> Developer Mode`).
-   - Right-click your username -> **Copy User ID**.
+2. **Telegram Bot Token**:
+   - Open Telegram and message [@BotFather](https://t.me/BotFather).
+   - Send `/newbot`, follow the prompts, and copy the **Bot Token**.
+3. **Your Telegram User ID**:
+   - Message [@userinfobot](https://t.me/userinfobot) on Telegram to get your numeric **User ID** (or use your `@username`).
 
 ---
 
@@ -48,10 +42,9 @@ WinMon is a secure Windows PC Remote Management tool that runs as a **Discord Bo
    Edit `internal/config/config.json`:
    ```json
    {
-     "bot_token": "YOUR_DISCORD_BOT_TOKEN",
-     "guild_id": "YOUR_DISCORD_SERVER_ID_OPTIONAL",
+     "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
      "allowed_users": [
-       "YOUR_DISCORD_USER_ID"
+       "YOUR_TELEGRAM_USER_ID_OR_USERNAME"
      ],
      "group": "home",
      "version": "1.0.0",
@@ -99,3 +92,4 @@ Run with Administrator privileges to manage the Windows Service:
 ## 📜 License
 
 This project is licensed under the MIT License.
+
