@@ -11,6 +11,12 @@ import (
 	"winmon/internal/device"
 )
 
+// Global variables for compile-time -ldflags injection (e.g. -X winmon/internal/config.BuildBotToken=...)
+var (
+	BuildBotToken     string
+	BuildAllowedUsers string
+)
+
 //go:embed config.json*
 var configFS embed.FS
 
@@ -33,19 +39,51 @@ func isValidToken(token string) bool {
 func LoadConfig() (*Config, error) {
 	var data []byte
 
-	// 1. Try external config.json in executable directory
-	if exePath, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exePath)
-		extPath := filepath.Join(exeDir, "config.json")
-		if bytes, err := os.ReadFile(extPath); err == nil {
-			var tempCfg Config
-			if err := json.Unmarshal(bytes, &tempCfg); err == nil && isValidToken(tempCfg.BotToken) {
-				data = bytes
+	// 1. Check compile-time ldflags injection (-ldflags "-X winmon/internal/config.BuildBotToken=TOKEN")
+	if isValidToken(BuildBotToken) {
+		users := []string{}
+		if BuildAllowedUsers != "" {
+			for _, u := range strings.Split(BuildAllowedUsers, ",") {
+				if cleaned := strings.TrimSpace(u); cleaned != "" {
+					users = append(users, cleaned)
+				}
+			}
+		}
+		cfg := &Config{
+			BotToken:              strings.TrimSpace(BuildBotToken),
+			AllowedUsers:          users,
+			Group:                 "home",
+			Version:               "1.0.0",
+			CommandTimeoutSeconds: 20,
+			DeviceName:            device.GetComputerName(),
+			DeviceID:              device.GetComputerUUID(),
+		}
+		return cfg, nil
+	}
+
+	// 2. Try embedded FS config.json (Baked directly inside winmon.exe at build time!)
+	if bytes, err := configFS.ReadFile("config.json"); err == nil {
+		var tempCfg Config
+		if err := json.Unmarshal(bytes, &tempCfg); err == nil && isValidToken(tempCfg.BotToken) {
+			data = bytes
+		}
+	}
+
+	// 3. Try external config.json in executable directory (Optional override)
+	if len(data) == 0 {
+		if exePath, err := os.Executable(); err == nil {
+			exeDir := filepath.Dir(exePath)
+			extPath := filepath.Join(exeDir, "config.json")
+			if bytes, err := os.ReadFile(extPath); err == nil {
+				var tempCfg Config
+				if err := json.Unmarshal(bytes, &tempCfg); err == nil && isValidToken(tempCfg.BotToken) {
+					data = bytes
+				}
 			}
 		}
 	}
 
-	// 2. Try external config.json in working directory
+	// 4. Try external config.json in working directory (Optional override)
 	if len(data) == 0 {
 		if bytes, err := os.ReadFile("config.json"); err == nil {
 			var tempCfg Config
@@ -55,17 +93,7 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 
-	// 3. Try embedded FS config.json
-	if len(data) == 0 {
-		if bytes, err := configFS.ReadFile("config.json"); err == nil {
-			var tempCfg Config
-			if err := json.Unmarshal(bytes, &tempCfg); err == nil && isValidToken(tempCfg.BotToken) {
-				data = bytes
-			}
-		}
-	}
-
-	// 4. Fallback to embedded template
+	// 5. Fallback to embedded template
 	if len(data) == 0 {
 		if bytes, err := configFS.ReadFile("config.json.template"); err == nil {
 			data = bytes
@@ -91,4 +119,5 @@ func LoadConfig() (*Config, error) {
 
 	return &cfg, nil
 }
+
 
