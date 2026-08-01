@@ -42,9 +42,32 @@ func TestPrepareUploadPath_ExplicitFile(t *testing.T) {
 }
 
 func TestPrepareUploadPath_EmptyPath(t *testing.T) {
-	_, err := PrepareUploadPath("  ", "file.txt")
-	if err == nil {
-		t.Error("expected error for empty destination path, got nil")
+	finalPath, err := PrepareUploadPath("  ", "file.txt")
+	if err != nil {
+		t.Fatalf("expected empty destination path to default to winmon_uploads, got error: %v", err)
+	}
+	expected := filepath.Join(defaultUploadDir(), "file.txt")
+	if finalPath != expected {
+		t.Errorf("expected '%s', got '%s'", expected, finalPath)
+	}
+	if !filepath.IsAbs(finalPath) {
+		t.Errorf("expected absolute upload path, got '%s'", finalPath)
+	}
+}
+
+func TestPrepareUploadPath_PathTraversal(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Malicious filename attempting path traversal
+	traversalFilename := "../../Windows/System32/malicious.dll"
+	finalPath, err := PrepareUploadPath(tempDir, traversalFilename)
+	if err != nil {
+		t.Fatalf("PrepareUploadPath failed: %v", err)
+	}
+
+	expected := filepath.Join(tempDir, "malicious.dll")
+	if finalPath != expected {
+		t.Errorf("expected path traversal to be neutralized to '%s', got '%s'", expected, finalPath)
 	}
 }
 

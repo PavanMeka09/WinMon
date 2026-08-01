@@ -92,8 +92,8 @@ func CaptureWebcam(outputPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open captured BMP: %v", err)
 	}
-	defer os.Remove(tmpBmpPath)
 	defer bmpFile.Close()
+	defer os.Remove(tmpBmpPath)
 
 	img, err := bmp.Decode(bmpFile)
 	if err != nil {

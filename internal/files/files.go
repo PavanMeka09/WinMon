@@ -91,13 +91,31 @@ func ZipDirectory(sourceDir, zipPath string) error {
 	return err
 }
 
-// PrepareUploadPath resolves the destination path for file uploads.
-// If dest is a directory, it appends the original filename.
-// It also creates any missing directories along the path.
+// defaultUploadDir returns a safe absolute directory for uploads when no
+// destination is specified. Using process CWD is unsafe under a Windows
+// service (often C:\Windows\System32).
+func defaultUploadDir() string {
+	sharedTemp := `C:\Windows\Temp`
+	if envRoot := os.Getenv("SystemRoot"); envRoot != "" {
+		sharedTemp = filepath.Join(envRoot, "Temp")
+	}
+	return filepath.Join(sharedTemp, "winmon_uploads")
+}
+
+// PrepareUploadPath resolves the destination path for file uploads safely.
+// If dest is empty, it defaults to %SystemRoot%\Temp\winmon_uploads.
+// If dest is a directory, it appends the sanitized filename (preventing path traversal).
+// It also creates any missing parent directories along the path.
 func PrepareUploadPath(dest, filename string) (string, error) {
+	cleanFilename := filepath.Base(filepath.Clean(filename))
+	if cleanFilename == "." || cleanFilename == "/" || cleanFilename == "\\" || cleanFilename == "" {
+		cleanFilename = "uploaded_file"
+	}
+
 	dest = strings.TrimSpace(dest)
 	if dest == "" {
-		return "", fmt.Errorf("empty destination path")
+		// Trailing separator forces directory handling even before the folder exists.
+		dest = defaultUploadDir() + string(os.PathSeparator)
 	}
 
 	var finalPath string
@@ -114,10 +132,12 @@ func PrepareUploadPath(dest, filename string) (string, error) {
 	}
 
 	if isDir {
-		finalPath = filepath.Join(dest, filename)
+		finalPath = filepath.Join(dest, cleanFilename)
 	} else {
 		finalPath = dest
 	}
+
+	finalPath = filepath.Clean(finalPath)
 
 	// Create any missing parent directories
 	parentDir := filepath.Dir(finalPath)

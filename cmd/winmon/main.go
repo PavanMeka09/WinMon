@@ -16,6 +16,15 @@ import (
 	"winmon/internal/service"
 )
 
+var (
+	kernel32        = windows.NewLazySystemDLL("kernel32.dll")
+	procFreeConsole = kernel32.NewProc("FreeConsole")
+)
+
+func hideConsoleWindow() {
+	procFreeConsole.Call()
+}
+
 func showMsgBox(title, msg string, isError bool) {
 	titlePtr, errTitle := windows.UTF16PtrFromString(title)
 	msgPtr, errMsg := windows.UTF16PtrFromString(msg)
@@ -51,6 +60,7 @@ func main() {
 
 	// 1. Persistent Session Agent Routing
 	if *sessionAgent {
+		hideConsoleWindow()
 		err := bot.RunSessionAgentLoop()
 		if err != nil {
 			log.Fatalf("Session agent error: %v", err)
@@ -60,6 +70,7 @@ func main() {
 
 	// 2. Session Helper Routing
 	if *sessionHelper {
+		hideConsoleWindow()
 		if *helperCmd == "" {
 			log.Fatal("Missing -cmd argument for session helper")
 		}
@@ -77,9 +88,6 @@ func main() {
 			log.Printf("Service action failed: %v", err)
 			showMsgBox("WinMon Service Error", fmt.Sprintf("Service action '%s' failed:\n%v", *serviceAction, err), true)
 			os.Exit(1)
-		}
-		if *serviceAction == "install" {
-			showMsgBox("WinMon Setup Complete", "WinMon Service installed and started successfully!\n\nIt is now running in the background as a Windows Service at C:\\Program Files\\WinMon\\winmon.exe.", false)
 		}
 		os.Exit(0)
 	}
@@ -116,7 +124,6 @@ func main() {
 
 			if running {
 				log.Println("WinMon service is already running in the background. Exiting...")
-				showMsgBox("WinMon Service", "WinMon is already installed and running active in the background.", false)
 				os.Exit(0)
 			} else {
 				log.Println("WinMon service is installed but not running. Attempting to start the service...")
@@ -125,12 +132,12 @@ func main() {
 					log.Printf("Failed to start service: %v. Requesting administrator privileges to re-install...", err)
 					errSvc := service.ElevateProcess("-service install")
 					if errSvc != nil {
-						showMsgBox("WinMon Error", fmt.Sprintf("Failed to install and start service:\n%v", errSvc), true)
+						log.Printf("Failed to request elevation for re-install: %v. Falling back to console mode.", errSvc)
+						showMsgBox("WinMon Error", fmt.Sprintf("Failed to install and start service:\n%v\n\nFalling back to console mode.", errSvc), true)
 					} else {
 						os.Exit(0)
 					}
 				} else {
-					showMsgBox("WinMon Service", "WinMon Service started successfully in the background.", false)
 					os.Exit(0)
 				}
 			}
