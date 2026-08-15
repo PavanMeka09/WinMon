@@ -12,6 +12,7 @@ import (
 
 	"winmon/internal/bot"
 	"winmon/internal/config"
+	"winmon/internal/executor"
 	"winmon/internal/service"
 )
 
@@ -57,7 +58,7 @@ func main() {
 	// 1. Persistent Session Agent Routing
 	if *sessionAgent {
 		hideConsoleWindow()
-		err := bot.RunSessionAgentLoop()
+		err := executor.RunSessionAgentLoop()
 		if err != nil {
 			log.Fatalf("Session agent error: %v", err)
 		}
@@ -70,7 +71,7 @@ func main() {
 		if *helperCmd == "" {
 			log.Fatal("Missing -cmd argument for session helper")
 		}
-		_, err := bot.RunSessionHelper(*helperCmd, *helperArgs, "")
+		_, err := executor.RunSessionHelper(*helperCmd, *helperArgs, "")
 		if err != nil {
 			log.Fatalf("Session helper error: %v", err)
 		}
