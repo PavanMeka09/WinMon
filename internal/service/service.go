@@ -437,11 +437,13 @@ func InstallService(name, displayName, desc string) error {
 	}
 
 	quotedExePath := fmt.Sprintf("\"%s\"", exePath)
-	s, err := m.CreateService(name, quotedExePath, mgr.Config{
-		DisplayName: displayName,
-		Description: desc,
-		StartType:   mgr.StartAutomatic,
-	})
+	svcConfig := mgr.Config{
+		DisplayName:  displayName,
+		Description:  desc,
+		StartType:    mgr.StartAutomatic,
+		Dependencies: []string{"Tcpip"},
+	}
+	s, err := m.CreateService(name, quotedExePath, svcConfig)
 	if err != nil {
 		// If service already exists, open it and update BinaryPathName
 		var openErr error
@@ -455,10 +457,19 @@ func InstallService(name, displayName, desc string) error {
 			c.DisplayName = displayName
 			c.Description = desc
 			c.StartType = mgr.StartAutomatic
+			c.Dependencies = []string{"Tcpip"}
 			_ = s.UpdateConfig(c)
 		}
 	}
 	defer s.Close()
+
+	// Configure automatic service restart on failure (retry after 5s, 10s, 15s)
+	recoveryActions := []mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: 5 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 10 * time.Second},
+		{Type: mgr.ServiceRestart, Delay: 15 * time.Second},
+	}
+	_ = s.SetRecoveryActions(recoveryActions, 86400)
 
 	// Explicitly set ImagePath and Description in registry to guarantee proper quoting
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `System\CurrentControlSet\Services\`+name, registry.WRITE)

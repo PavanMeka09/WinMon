@@ -54,9 +54,32 @@ func (b *BotCoordinator) Start() {
 		log.Printf("WARNING: non-numeric allowed_users entries are ignored (use numeric Telegram user IDs only): %v", skipped)
 	}
 
-	bot, err := tgbotapi.NewBotAPI(b.cfg.BotToken)
-	if err != nil {
-		log.Fatalf("Failed to create Telegram bot session: %v", err)
+	var bot *tgbotapi.BotAPI
+	backoff := 2 * time.Second
+
+	for {
+		select {
+		case <-b.stopChan:
+			log.Println("WinMon stopping before Telegram bot session established.")
+			return
+		default:
+		}
+
+		var err error
+		bot, err = tgbotapi.NewBotAPI(b.cfg.BotToken)
+		if err == nil {
+			break
+		}
+
+		log.Printf("Waiting for network/Telegram connection: %v (retrying in %v)...", err, backoff)
+		select {
+		case <-b.stopChan:
+			return
+		case <-time.After(backoff):
+			if backoff < 30*time.Second {
+				backoff += 2 * time.Second
+			}
+		}
 	}
 	b.bot = bot
 
