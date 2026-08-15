@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -27,10 +28,23 @@ type IPCResponse struct {
 	OutputText string `json:"output_text,omitempty"`
 }
 
-var ipcMu sync.Mutex
-
+var (
+	ipcMu              sync.Mutex
+	kernel32           = windows.NewLazySystemDLL("kernel32.dll")
+	procWaitNamedPipeW = kernel32.NewProc("WaitNamedPipeW")
+)
+// createPipeSecurityAttributes builds a DACL that allows only SYSTEM and the
+// current process user. Interactive Users (IU) are intentionally excluded so
+// arbitrary session processes cannot drive the agent pipe.
 func createPipeSecurityAttributes() *windows.SecurityAttributes {
-	sd, err := windows.SecurityDescriptorFromString("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)")
+	sddl := "D:(A;;GA;;;SY)(A;;GA;;;BA)"
+	if sid, err := currentProcessUserSID(); err == nil && sid != "" {
+		sddl = fmt.Sprintf("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;%s)", sid)
+	} else if err != nil {
+		logDebug("currentProcessUserSID error (falling back to SY|BA pipe ACL): %v", err)
+	}
+
+	sd, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		logDebug("SecurityDescriptorFromString error: %v", err)
 		return nil
@@ -42,12 +56,21 @@ func createPipeSecurityAttributes() *windows.SecurityAttributes {
 	return &sa
 }
 
+func currentProcessUserSID() (string, error) {
+	token := windows.GetCurrentProcessToken()
+	tu, err := token.GetTokenUser()
+	if err != nil {
+		return "", err
+	}
+	return tu.User.Sid.String(), nil
+}
+
 // SendIPCCommand is called by the Service (Session 0) to send a command request to the Persistent User Agent (Session 1) over Named Pipe IPC.
 func SendIPCCommand(req IPCRequest, timeout time.Duration) (*IPCResponse, error) {
-	// Ensure the User Agent is active in Session 1 (guarded by mutex)
 	ipcMu.Lock()
+	defer ipcMu.Unlock()
+
 	err := EnsureUserAgentRunning()
-	ipcMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure user agent is running: %w", err)
 	}
@@ -73,6 +96,14 @@ func SendIPCCommand(req IPCRequest, timeout time.Duration) (*IPCResponse, error)
 			break
 		}
 
+		if errors.Is(err, windows.ERROR_PIPE_BUSY) {
+			// Wait up to 2 seconds for a pipe instance to become available
+			ret, _, _ := procWaitNamedPipeW.Call(uintptr(unsafe.Pointer(pipePathUTF16)), 2000)
+			if ret != 0 {
+				continue
+			}
+		}
+
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("timeout connecting to IPC pipe %s: %w", PipeName, err)
 		}
@@ -82,12 +113,14 @@ func SendIPCCommand(req IPCRequest, timeout time.Duration) (*IPCResponse, error)
 	pipeFile := os.NewFile(uintptr(hPipe), PipeName)
 	defer pipeFile.Close()
 
-	// Send Request JSON
+	if err := pipeFile.SetDeadline(deadline); err != nil {
+		logDebug("IPC SetDeadline error: %v", err)
+	}
+
 	if err := json.NewEncoder(pipeFile).Encode(req); err != nil {
 		return nil, fmt.Errorf("IPC write request failed: %w", err)
 	}
 
-	// Read Response JSON
 	var resp IPCResponse
 	if err := json.NewDecoder(pipeFile).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("IPC read response failed: %w", err)

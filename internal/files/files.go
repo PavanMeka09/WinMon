@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"winmon/internal/service"
 )
 
 // ZipDirectory compresses a directory into a temporary ZIP file.
@@ -95,11 +97,7 @@ func ZipDirectory(sourceDir, zipPath string) error {
 // destination is specified. Using process CWD is unsafe under a Windows
 // service (often C:\Windows\System32).
 func defaultUploadDir() string {
-	sharedTemp := `C:\Windows\Temp`
-	if envRoot := os.Getenv("SystemRoot"); envRoot != "" {
-		sharedTemp = filepath.Join(envRoot, "Temp")
-	}
-	return filepath.Join(sharedTemp, "winmon_uploads")
+	return filepath.Join(service.GetSharedTempDir(), "uploads")
 }
 
 // PrepareUploadPath resolves the destination path for file uploads safely.

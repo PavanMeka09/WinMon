@@ -3,6 +3,7 @@ package display
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -12,6 +13,7 @@ import (
 var (
 	user32                    = syscall.NewLazyDLL("user32.dll")
 	procSystemParametersInfoW = user32.NewProc("SystemParametersInfoW")
+	procLockWorkStation       = user32.NewProc("LockWorkStation")
 )
 
 const (
@@ -27,10 +29,14 @@ func SetBrightness(brightness int) error {
 	} else if brightness > 100 {
 		brightness = 100
 	}
-	psCmd := fmt.Sprintf(`Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{ Timeout = 0; Brightness = %d }`, brightness)
+	psCmd := fmt.Sprintf(`$mon = Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop; if (-not $mon) { throw "No WMI brightness monitor found" }; $mon | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{ Timeout = 0; Brightness = %d }`, brightness)
 	c := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd)
 	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	return c.Run()
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("brightness control failed (monitor may not support WMI brightness control, e.g. external desktop monitor): %s", strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // GetWallpaperPath retrieves the current desktop wallpaper file path from the registry.
@@ -64,6 +70,14 @@ func SetWallpaperLocal(path string) error {
 
 	if ret == 0 {
 		return fmt.Errorf("failed to set wallpaper: %v", err)
+	}
+	return nil
+}
+// LockWorkstation locks the interactive Windows workstation.
+func LockWorkstation() error {
+	ret, _, err := procLockWorkStation.Call()
+	if ret == 0 {
+		return fmt.Errorf("failed to lock workstation: %v", err)
 	}
 	return nil
 }

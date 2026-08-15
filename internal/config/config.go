@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"winmon/internal/device"
@@ -33,7 +34,24 @@ type Config struct {
 
 func isValidToken(token string) bool {
 	t := strings.TrimSpace(token)
-	return t != "" && t != "YOUR_DISCORD_BOT_TOKEN" && t != "YOUR_TELEGRAM_BOT_TOKEN"
+	return t != "" && t != "YOUR_TELEGRAM_BOT_TOKEN"
+}
+
+// NormalizeAllowedUsers keeps only numeric Telegram user IDs. Usernames are
+// rejected because they are weaker and easier to spoof/confuse.
+func NormalizeAllowedUsers(users []string) (numeric []string, skipped []string) {
+	for _, u := range users {
+		cleaned := strings.TrimPrefix(strings.TrimSpace(u), "@")
+		if cleaned == "" {
+			continue
+		}
+		if _, err := strconv.ParseInt(cleaned, 10, 64); err != nil {
+			skipped = append(skipped, u)
+			continue
+		}
+		numeric = append(numeric, cleaned)
+	}
+	return numeric, skipped
 }
 
 func LoadConfig() (*Config, error) {
@@ -58,6 +76,7 @@ func LoadConfig() (*Config, error) {
 			DeviceName:            device.GetComputerName(),
 			DeviceID:              device.GetComputerUUID(),
 		}
+		cfg.AllowedUsers, _ = NormalizeAllowedUsers(cfg.AllowedUsers)
 		return cfg, nil
 	}
 
@@ -116,6 +135,7 @@ func LoadConfig() (*Config, error) {
 	// Dynamically override DeviceName and DeviceID
 	cfg.DeviceName = device.GetComputerName()
 	cfg.DeviceID = device.GetComputerUUID()
+	cfg.AllowedUsers, _ = NormalizeAllowedUsers(cfg.AllowedUsers)
 
 	return &cfg, nil
 }

@@ -74,13 +74,80 @@ func logDebug(format string, a ...interface{}) {
 	fmt.Fprintf(f, "[%s] "+format+"\n", append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, a...)...)
 }
 
-// GetSharedTempDir returns the consistent shared temp directory path (C:\Windows\Temp by default).
+// GetSharedTempDir returns a private WinMon working directory under ProgramData
+// (not the world-readable Windows\Temp). It creates the directory if needed and
+// applies a restrictive DACL (SYSTEM, Administrators, and the active console user).
 func GetSharedTempDir() string {
-	sharedTemp := "C:\\Windows\\Temp"
-	if envRoot := os.Getenv("SystemRoot"); envRoot != "" {
-		sharedTemp = filepath.Join(envRoot, "Temp")
+	base := os.Getenv("ProgramData")
+	if base == "" {
+		base = `C:\ProgramData`
 	}
-	return sharedTemp
+	dir := filepath.Join(base, "WinMon", "temp")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		logDebug("GetSharedTempDir MkdirAll failed: %v", err)
+		return dir
+	}
+	if err := restrictDirectoryACL(dir); err != nil {
+		logDebug("GetSharedTempDir ACL apply failed: %v", err)
+	}
+	return dir
+}
+
+// restrictDirectoryACL sets a protected DACL: SYSTEM + Administrators + active
+// console user (when available) + current process user. No broad IU grant.
+func restrictDirectoryACL(path string) error {
+	sids := map[string]struct{}{
+		"SY": {},
+		"BA": {},
+	}
+	if sid, err := currentProcessUserSID(); err == nil && sid != "" {
+		sids[sid] = struct{}{}
+	}
+	if sid, err := activeConsoleUserSID(); err == nil && sid != "" {
+		sids[sid] = struct{}{}
+	}
+
+	aces := make([]string, 0, len(sids))
+	for sid := range sids {
+		aces = append(aces, fmt.Sprintf("(A;OICI;FA;;;%s)", sid))
+	}
+	sddl := "D:PAI" + strings.Join(aces, "")
+
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil,
+		nil,
+		dacl,
+		nil,
+	)
+}
+
+func activeConsoleUserSID() (string, error) {
+	sessionID := windows.WTSGetActiveConsoleSessionId()
+	if sessionID == 0xFFFFFFFF {
+		return "", fmt.Errorf("no active console session")
+	}
+	var userToken windows.Token
+	if err := windows.WTSQueryUserToken(sessionID, &userToken); err != nil {
+		return "", err
+	}
+	defer userToken.Close()
+
+	tu, err := userToken.GetTokenUser()
+	if err != nil {
+		return "", err
+	}
+	return tu.User.Sid.String(), nil
 }
 
 // RunInUserSession spawns WinMon.exe as a helper inside the active console session.
@@ -540,6 +607,32 @@ func IsServiceRunning(name string) (bool, error) {
 	}
 
 	return status.CurrentState == windows.SERVICE_RUNNING, nil
+}
+
+// RestartServiceDetached stops and starts the WinMon service from an external
+// PowerShell process so the currently running service can exit cleanly first.
+func RestartServiceDetached() error {
+	scriptPath := filepath.Join(GetSharedTempDir(), "winmon_restart.ps1")
+	psScript := `
+$ErrorActionPreference = "Continue"
+Set-Location -Path "C:\"
+Start-Sleep -Seconds 2
+Stop-Service -Name WinMon -Force -ErrorAction SilentlyContinue
+$limit = 15
+while ((Get-Service -Name WinMon -ErrorAction SilentlyContinue).Status -eq "Running" -and $limit -gt 0) {
+    Start-Sleep -Seconds 1
+    $limit--
+}
+Start-Service -Name WinMon -ErrorAction SilentlyContinue
+Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+`
+	if err := os.WriteFile(scriptPath, []byte(psScript), 0644); err != nil {
+		return err
+	}
+
+	cmdLine := fmt.Sprintf("Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = 'powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -File \"%s\"' }", filepath.ToSlash(scriptPath))
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+	return cmd.Start()
 }
 
 // ElevateProcess re-runs the current executable elevated with administrative arguments.

@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/windows"
@@ -42,11 +41,8 @@ func showMsgBox(title, msg string, isError bool) {
 }
 
 func main() {
-	// Set shared temp directory for Session 0 service <-> Session 1 helper coordination
-	sharedTemp := "C:\\Windows\\Temp"
-	if envRoot := os.Getenv("SystemRoot"); envRoot != "" {
-		sharedTemp = filepath.Join(envRoot, "Temp")
-	}
+	// Point TEMP/TMP at the private WinMon working directory (not world-readable Windows\Temp)
+	sharedTemp := service.GetSharedTempDir()
 	os.Setenv("TEMP", sharedTemp)
 	os.Setenv("TMP", sharedTemp)
 
@@ -74,7 +70,7 @@ func main() {
 		if *helperCmd == "" {
 			log.Fatal("Missing -cmd argument for session helper")
 		}
-		err := bot.RunSessionHelper(*helperCmd, *helperArgs, "")
+		_, err := bot.RunSessionHelper(*helperCmd, *helperArgs, "")
 		if err != nil {
 			log.Fatalf("Session helper error: %v", err)
 		}
